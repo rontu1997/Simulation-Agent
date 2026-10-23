@@ -13,7 +13,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from simagent.config import Config, GmxConfig
 from simagent.core.paths import sha256_text
@@ -56,6 +56,14 @@ class RunResult:
     stderr: str
     seq_start: int | None = None
     seq_end: int | None = None
+
+
+class RunnerLike(Protocol):
+    """What the build, grompp, and probe code need from a runner (tests supply stubs)."""
+
+    def run(self, args: Sequence[str], *, cwd: Path, stage: str = ..., tool: str = ...,
+            stdin: str | None = ..., inputs: Sequence[Path] = ..., outputs: Sequence[Path] = ...,
+            base: Path | None = ..., timeout: float | None = ...) -> RunResult: ...
 
 
 class GmxRunner:
