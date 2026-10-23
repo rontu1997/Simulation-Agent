@@ -40,7 +40,7 @@ Tool-to-module mapping (the 21 tools of section 4.1): `tools_env.py` has tool 1;
 
 ## 2. Configuration
 
-Precedence: environment variables, then `config.yaml`, then built-in defaults. Secrets (`LUNA_API_KEY`, `SIMAGENT_APPROVAL_TOKEN`) are accepted from the environment only; if found in `config.yaml` the loader refuses to start.
+Precedence: environment variables, then `config.yaml`, then built-in defaults. Secrets (`LUNA_API_KEY`, `SIMAGENT_APPROVAL_TOKEN`) are accepted from the environment only; if found in `config.yaml` the loader refuses to start. The `simagent` CLI may fill the environment from a `.env` file first (`./.env` when it exists, or `--env-file PATH`): a variable already set in the shell wins over the file, only `LUNA_*`, `GMX_*`, and `SIMAGENT_*` keys are read (never `SIMAGENT_APPROVAL_TOKEN`, which is generated for each launch), and messages name keys and line numbers, never values. `.env` is git-ignored; `.env.example` shows the keys. The MCP server (`gmx-mcp`) does not read `.env`; the CLI passes it the filtered environment.
 
 ```yaml
 gmx:

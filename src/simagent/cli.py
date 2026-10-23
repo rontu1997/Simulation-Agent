@@ -26,6 +26,7 @@ from simagent.agent.conversation import ChatClient
 from simagent.agent.request import draft_from_request_file, finalize, non_interactive_errors
 from simagent.agent.session import Console, Session
 from simagent.config import Config, ConfigError, default_config_path, load_config
+from simagent.envfile import EnvFileError, load_env_file
 from simagent.llm import LlmClient
 from simagent.mcp_client import McpSession, server_params
 
@@ -130,6 +131,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="simagent", description=__doc__.split("\n")[0]
                                      if __doc__ else None)
     parser.add_argument("--version", action="store_true", help="print the version and exit")
+    parser.add_argument("--env-file", metavar="PATH",
+                        help="read LUNA_*, GMX_*, and SIMAGENT_* settings from this file "
+                        "(default: ./.env if it exists; real environment variables win)")
     commands = parser.add_subparsers(dest="command")
     run = commands.add_parser("run", help="run a finished request file without a conversation")
     run.add_argument("--request-file", required=True, help="a JSON request (design 3.1 shape)")
@@ -145,6 +149,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.version:
         print(f"simagent {__version__}")
         return 0
+    if not _load_env(args.env_file):
+        return 2
     try:
         cfg = load_config(yaml_path=default_config_path())
     except (ConfigError, OSError, ValueError) as exc:
@@ -161,6 +167,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:  # report, never a traceback; the run itself is untouched
         _error(f"{type(exc).__name__}: {exc}")
         return 1
+
+
+def _load_env(option: str | None) -> bool:
+    """Load the env file (the option, else ./.env when present) into the process environment."""
+    path = Path(option) if option else (Path(".env") if Path(".env").is_file() else None)
+    if path is None:
+        return True
+    try:
+        _, warnings = load_env_file(path, os.environ)
+    except EnvFileError as exc:
+        _error(str(exc))
+        return False
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    return True
 
 
 def _read_request(path: str) -> dict[str, Any] | None:
