@@ -1,0 +1,180 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "settle",
+      "pattern": "Water molecule starting at atom \\d+ can not be settled",
+      "source": "stderr",
+      "cause": "Overlaps after build, a bad energy minimization, or a time step that is too large",
+      "action": "retry",
+      "auto": true,
+      "steps": [
+        {"key": "emtol", "value": 100, "target": "em"},
+        {"key": "dt", "value": 0.001, "target": "nvt"}
+      ],
+      "hint": "Re-run EM with emtol = 100; if it recurs, use dt = 0.001.",
+      "verified": false
+    },
+    {
+      "id": "lincs",
+      "pattern": "LINCS WARNING|Too many LINCS warnings",
+      "source": "stderr",
+      "cause": "Constraint failures from overlaps or a large time step (systems with LINCS)",
+      "action": "retry",
+      "auto": true,
+      "steps": [
+        {"key": "emtol", "value": 100, "target": "em"},
+        {"key": "dt", "value": 0.001, "target": "nvt"}
+      ],
+      "hint": "Re-run EM with emtol = 100; if it recurs, use dt = 0.001.",
+      "verified": false
+    },
+    {
+      "id": "nan",
+      "checks": ["no_nan"],
+      "cause": "The simulation blew up (NaN or Inf in the energies)",
+      "action": "retry",
+      "auto": true,
+      "steps": [
+        {"key": "emtol", "value": 100, "target": "em"},
+        {"key": "dt", "value": 0.001, "target": "nvt"}
+      ],
+      "hint": "Same remedy as the SETTLE failure: tighter EM, then a smaller time step.",
+      "verified": true
+    },
+    {
+      "id": "em_not_converged",
+      "pattern": "did not converge to Fmax|Energy minimization reached the maximum number of steps",
+      "source": "log",
+      "cause": "Too few EM steps for the starting configuration",
+      "action": "retry",
+      "auto": true,
+      "steps": [
+        {"key": "em_nsteps", "value": 100000, "target": "em"},
+        {"key": "em_nsteps", "value": 200000, "target": "em"}
+      ],
+      "hint": "Re-run EM with 100,000 steps, then 200,000.",
+      "verified": false
+    },
+    {
+      "id": "em_machine_precision",
+      "pattern": "forces have not converged to the requested precision",
+      "source": "log",
+      "cause": "EM stopped at machine precision before reaching the requested emtol",
+      "action": "escalate",
+      "auto": false,
+      "hint": "Show the final Fmax. A looser emtol changes the protocol, so it needs a plan edit and a new approval.",
+      "verified": false
+    },
+    {
+      "id": "count_mismatch",
+      "pattern": "number of coordinates in coordinate file .* does not match topology",
+      "source": "grompp",
+      "cause": "The molecule count in the coordinates and the topology differ",
+      "action": "escalate",
+      "auto": false,
+      "hint": "Rebuild with build_water_box, then set_plan and a new approval.",
+      "verified": false
+    },
+    {
+      "id": "missing_moleculetype",
+      "pattern": "No such moleculetype SOL|Atomtype .* not found|Unknown (residue|atom ?type)",
+      "source": "grompp",
+      "cause": "The topology is missing or has the wrong include",
+      "action": "escalate",
+      "auto": false,
+      "hint": "Regenerate the topology from the force-field choice, then set_plan and a new approval.",
+      "verified": false
+    },
+    {
+      "id": "include_missing",
+      "pattern": "(Topology include|Include) file .* not found",
+      "source": "grompp",
+      "cause": "GROMACS could not find its data directory",
+      "action": "escalate",
+      "auto": false,
+      "hint": "Run gmx_check_environment and show GMXDATA and GMXLIB.",
+      "verified": false
+    },
+    {
+      "id": "box_small",
+      "pattern": "longer than half the shortest box vector|cut-off length is longer",
+      "source": "grompp",
+      "cause": "The box is too small for the cut-offs",
+      "action": "escalate",
+      "auto": false,
+      "hint": "Offer a larger system or a smaller cut-off; both change the system or the method.",
+      "verified": false
+    },
+    {
+      "id": "grompp_warning",
+      "pattern": "^WARNING \\d+ \\[|There (was|were) \\d+ warnings?|Too many warnings \\(\\d+\\)",
+      "source": "grompp",
+      "cause": "grompp flagged a real setup issue",
+      "action": "escalate",
+      "auto": false,
+      "hint": "Show each warning with its id and ask for a decision; -maxwarn only through an acknowledgement.",
+      "verified": false
+    },
+    {
+      "id": "pressure_scaling",
+      "pattern": "Pressure scaling more than 1%",
+      "source": "stderr",
+      "cause": "The barostat is too aggressive",
+      "action": "retry",
+      "auto": true,
+      "steps": [
+        {"key": "tau_p", "value": 5.0, "target": "npt"}
+      ],
+      "hint": "Use tau_p = 5.0.",
+      "verified": false
+    },
+    {
+      "id": "domain_decomposition",
+      "pattern": "domain decomposition|too many ranks|cannot be partitioned",
+      "source": "stderr",
+      "cause": "The rank count is unsuitable for about 4,000 atoms",
+      "action": "escalate",
+      "auto": false,
+      "hint": "Show the cause and set gmx.ntmpi in the configuration (auto already means 1 rank below 10,000 atoms).",
+      "verified": false
+    },
+    {
+      "id": "segfault",
+      "pattern": "Segmentation fault|Illegal instruction",
+      "source": "stderr",
+      "cause": "A problem with the binary or the environment",
+      "action": "escalate",
+      "auto": false,
+      "hint": "Run gmx_check_environment and report.",
+      "verified": true
+    },
+    {
+      "id": "out_of_memory",
+      "pattern": "Out of memory|No space left on device",
+      "source": "stderr",
+      "cause": "The host ran out of memory or disk",
+      "action": "escalate",
+      "auto": false,
+      "hint": "Free the resource and report.",
+      "verified": true
+    },
+    {
+      "id": "process_died",
+      "causes": ["process_died", "timeout"],
+      "cause": "The mdrun process was killed or lost",
+      "action": "resume",
+      "auto": false,
+      "hint": "Offer run_mdrun(resume=true) from the checkpoint.",
+      "verified": true
+    },
+    {
+      "id": "unknown",
+      "cause": "No known pattern matches",
+      "action": "escalate",
+      "auto": false,
+      "hint": "Show the log excerpt, mark the confidence as low, and ask the researcher.",
+      "verified": true
+    }
+  ]
+}
