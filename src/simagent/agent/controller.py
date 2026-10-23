@@ -189,6 +189,8 @@ class Controller:
             started = await self._call("run_mdrun", {**args, "resume": False})
             if not started["ok"]:
                 return self._outcome("escalate", stage, _describe(started))
+        elif status in ("FAILED", "CANCELLED"):
+            return await self._stopped_stage(job_id, stage, job, status)
         elif status != "RUNNING":
             return self._outcome("escalate", stage, f"{stage} is {status} and needs a decision")
         await self._poll(job_id, stage)
@@ -243,6 +245,52 @@ class Controller:
                   if c["status"] in ("fail", "no_receipt", "not_run")]
         return await self._diagnose(job_id, stage, failed)
 
+    async def _stopped_stage(self, job_id: str, stage: str, job: dict[str, Any],
+                             status: str) -> Outcome:
+        """A stage found FAILED or CANCELLED (a reattach, or a stage left by an earlier run)."""
+        causes = [f["cause"] for f in job.get("failures", []) if f["stage"] == stage]
+        last = causes[-1] if causes else ""
+        if status == "CANCELLED":
+            return await self._interrupted(job_id, stage, "cancelled")
+        if last in ("process_died", "timeout"):
+            return await self._interrupted(job_id, stage, last)
+        prefix = "gate failed: "  # a failed gate after a finished run is never resumed
+        names = last[len(prefix):] if last.startswith(prefix) else ""
+        failed = [n.strip() for n in names.split(",") if n.strip()]
+        return await self._diagnose(job_id, stage, failed)
+
+    async def _has_checkpoint(self, job_id: str, stage: str) -> bool:
+        listing = await self._call("list_artifacts", {"job_id": job_id, "stage": stage})
+        return bool(listing["ok"] and any(
+            str(f["path"]).endswith(f"{stage}.cpt") for f in listing["data"]["files"]))
+
+    async def _interrupted(self, job_id: str, stage: str, cause: str,
+                           has_checkpoint: bool | None = None,
+                           diagnosis: Diagnosis | None = None) -> Outcome:
+        """The process died, timed out, or was cancelled: ask the researcher, then resume from
+        the checkpoint or restart from grompp (always raising ``_Restart``), or stop."""
+        if has_checkpoint is None:
+            has_checkpoint = await self._has_checkpoint(job_id, stage)
+        choice = await self.decisions.on_interrupted(job_id, stage, cause, has_checkpoint)
+        if choice == "resume" and has_checkpoint:
+            started = await self._call("run_mdrun", {
+                "job_id": job_id, "stage": stage, "resume": True})
+            if not started["ok"]:
+                return self._outcome("escalate", stage, _describe(started))
+            self.disclosures.append(f"Resumed {stage} from its checkpoint after it {cause}")
+            self._emit("EXECUTE", job_id, stage, resumed=True)
+            raise _Restart
+        if choice in ("resume", "restart"):
+            reset = await self._call("write_mdp", {"job_id": job_id, "stage": stage,
+                                                    "reset": True})
+            if not reset["ok"]:
+                return self._outcome("escalate", stage, _describe(reset))
+            self.disclosures.append(f"Restarted {stage} from grompp after it {cause}")
+            raise _Restart
+        status = "cancelled" if cause == "cancelled" else "escalate"
+        return self._outcome(status, stage, f"{stage} was interrupted ({cause}) and the run "
+                             "was stopped at your request", diagnosis)
+
     async def _diagnose(self, job_id: str, stage: str, failed_checks: list[str]) -> Outcome:
         """Match the playbook and apply the next allowed retry (raising ``_Restart``), or
         return the escalation for the researcher."""
@@ -250,6 +298,8 @@ class Controller:
         job = await self._call("get_job", {"job_id": job_id})
         data = job["data"] if job["ok"] else {}
         causes = [f["cause"] for f in data.get("failures", []) if f["stage"] == stage][-1:]
+        died = bool(causes) and causes[0] in ("process_died", "timeout")
+        has_checkpoint = await self._has_checkpoint(job_id, stage) if died else False
         texts: dict[str, str] = {}
         for which in ("log", "grompp", "stderr"):
             excerpt = await self._call("get_log_excerpt", {
@@ -257,8 +307,10 @@ class Controller:
             if excerpt["ok"]:
                 texts[which] = "\n".join(excerpt["data"]["lines"])
         diagnosis = self.diagnostician.diagnose(
-            Evidence(stage, texts, failed_checks, causes, False), data.get("retries", []))
+            Evidence(stage, texts, failed_checks, causes, has_checkpoint), data.get("retries", []))
         entry = diagnosis.entry
+        if entry.id == "process_died":
+            return await self._interrupted(job_id, stage, causes[0], has_checkpoint, diagnosis)
         if entry.action == "retry" and diagnosis.step is not None:
             step = diagnosis.step
             applied = await self._call("write_mdp", {

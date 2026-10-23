@@ -254,18 +254,19 @@ class FakeServer:
     """
 
     def __init__(self, statuses=None, runs=None, retries=(), grompp_fail=None,
-                 refuse_retry=None, forget_retries=False, checkpoint=False):
+                 refuse_retry=None, forget_retries=False, checkpoint=False, failures=(),
+                 current=None):
         self.status = {"build": "PASSED", "analysis": "PENDING",
                        **{s: "PENDING" for s in PROCESS}, **(statuses or {})}
         self.runs = {k: list(v) for k, v in (runs or {}).items()}
         self.retries = [dict(r) for r in retries]
-        self.failures: list[dict[str, Any]] = []
+        self.failures: list[dict[str, Any]] = [dict(f) for f in failures]
         self.grompp_fail = grompp_fail or {}
         self.refuse_retry = refuse_retry
         self.forget_retries = forget_retries
         self.checkpoint = checkpoint
         self.attempts = {s: 0 for s in PROCESS}
-        self.current: dict[str, Any] = {}
+        self.current: dict[str, Any] = dict(current or {})
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def names(self):
@@ -452,3 +453,100 @@ async def test_log_text_is_evidence_only():
     assert server.args_of("run_mdrun") == [
         {"job_id": "j1", "stage": "em", "resume": False},
         {"job_id": "j1", "stage": "nvt", "resume": False}]
+
+
+# -- resume and reattach (TASK-031) ---------------------------------------------------------------
+
+DIED = {"cause": "process_died"}
+
+
+def server_with_died_prod(**kwargs):
+    statuses = {"em": "PASSED", "nvt": "PASSED", "npt": "PASSED", "prod": "RUNNING"}
+    return FakeServer(statuses=statuses, current={"prod": dict(DIED)}, **kwargs)
+
+
+@pytest.mark.anyio
+async def test_reattach_to_a_running_stage_polls_without_restarting():
+    statuses = {"em": "PASSED", "nvt": "PASSED", "npt": "PASSED", "prod": "RUNNING"}
+    server = FakeServer(statuses=statuses)
+    outcome = await make(server).run("j1")
+    assert outcome.status == "done"
+    assert not {"write_mdp", "run_grompp", "run_mdrun"} & set(server.names())
+    assert server.names().count("get_run_status") == 1
+
+
+@pytest.mark.anyio
+async def test_died_process_moves_to_failed_through_validate_then_resumes():
+    server = server_with_died_prod(checkpoint=True)
+    decider = Decider(interrupted="resume")
+    outcome = await make(server, decider).run("j1")
+    assert outcome.status == "done"
+    assert server.args_of("run_mdrun") == [{"job_id": "j1", "stage": "prod", "resume": True}]
+    assert server.names().index("validate_stage") < server.names().index("run_mdrun")
+    assert decider.seen == [("interrupted", "j1", "prod", "process_died", True)]
+    assert any("Resumed prod" in line for line in outcome.disclosures)
+
+
+@pytest.mark.anyio
+async def test_died_process_restart_resets_and_reruns_from_grompp():
+    server = server_with_died_prod(checkpoint=True)
+    outcome = await make(server, Decider(interrupted="restart")).run("j1")
+    assert outcome.status == "done"
+    assert {"job_id": "j1", "stage": "prod", "reset": True} in server.args_of("write_mdp")
+    assert server.args_of("run_mdrun") == [{"job_id": "j1", "stage": "prod", "resume": False}]
+    assert server.names().count("run_grompp") == 1
+
+
+@pytest.mark.anyio
+async def test_died_process_stop_escalates_without_starting_anything():
+    server = server_with_died_prod(checkpoint=True)
+    outcome = await make(server, Decider(interrupted="stop")).run("j1")
+    assert outcome.status == "escalate" and outcome.stage == "prod"
+    assert server.args_of("run_mdrun") == [] and retry_calls(server) == []
+
+
+@pytest.mark.anyio
+async def test_died_without_checkpoint_cannot_resume():
+    server = server_with_died_prod(checkpoint=False)
+    decider = Decider(interrupted="resume")
+    outcome = await make(server, decider).run("j1")
+    assert outcome.status == "done"
+    assert decider.seen == [("interrupted", "j1", "prod", "process_died", False)]
+    assert all(a["resume"] is False for a in server.args_of("run_mdrun"))
+    assert {"job_id": "j1", "stage": "prod", "reset": True} in server.args_of("write_mdp")
+
+
+@pytest.mark.anyio
+async def test_cancelled_stage_found_on_reattach():
+    server = FakeServer(statuses={"em": "PASSED", "nvt": "CANCELLED"}, checkpoint=True)
+    decider = Decider(interrupted="resume")
+    outcome = await make(server, decider).run("j1")
+    assert outcome.status == "done"
+    assert decider.seen[0] == ("interrupted", "j1", "nvt", "cancelled", True)
+    assert server.args_of("run_mdrun")[0] == {"job_id": "j1", "stage": "nvt", "resume": True}
+
+
+@pytest.mark.anyio
+async def test_cancelled_stage_stop_is_a_cancelled_outcome():
+    server = FakeServer(statuses={"em": "PASSED", "nvt": "CANCELLED"})
+    outcome = await make(server, Decider(interrupted="stop")).run("j1")
+    assert outcome.status == "cancelled" and outcome.stage == "nvt"
+
+
+@pytest.mark.anyio
+async def test_failed_gate_after_finished_run_is_not_resumed():
+    server = FakeServer(statuses={"em": "PASSED", "nvt": "FAILED"}, checkpoint=True,
+                        failures=[{"stage": "nvt", "cause": "gate failed: mean_temperature"}])
+    decider = Decider(interrupted="resume")
+    outcome = await make(server, decider).run("j1")
+    assert outcome.status == "escalate" and decider.seen == []
+    assert server.args_of("run_mdrun") == []
+
+
+@pytest.mark.anyio
+async def test_resume_counts_against_the_round_limit():
+    server = server_with_died_prod(checkpoint=True)
+    server.runs = {"prod": [dict(DIED)] * 50}
+    outcome = await make(server, Decider(interrupted="resume"), max_rounds=5).run("j1")
+    assert outcome.status == "limit"
+    assert 1 <= len(server.args_of("run_mdrun")) <= 5
