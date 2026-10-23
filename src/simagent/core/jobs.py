@@ -144,7 +144,9 @@ class JobStore:
         self._clock = clock
 
     def _roots(self) -> list[Path]:
-        return [Path(self.cfg.paths.runs_dir), Path(self.cfg.paths.sim_runs_dir)]
+        # absolute, so job paths mean the same thing to the server, the wrapper, and clients
+        return [Path(self.cfg.paths.runs_dir).resolve(),
+                Path(self.cfg.paths.sim_runs_dir).resolve()]
 
     def create(self, request: dict[str, Any], execution_mode: str,
                environment: dict[str, Any]) -> JobHandle:
@@ -154,7 +156,7 @@ class JobStore:
                 f"{_num(request.get('thermo', {}).get('temperature_K', 0))}K-"
                 f"{self._clock().strftime('%Y%m%d')}")
         root = Path(self.cfg.paths.sim_runs_dir if execution_mode == "simulated"
-                    else self.cfg.paths.runs_dir)
+                    else self.cfg.paths.runs_dir).resolve()
         root.mkdir(parents=True, exist_ok=True)
         k = 1
         while True:

@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -91,3 +92,23 @@ def test_launch_survives_and_finishes_independently(tmp_path):
             break
         time.sleep(0.1)
     assert (stage_dir / "run.exit").read_text(encoding="utf-8").strip() == "0"
+
+
+def test_launch_accepts_relative_paths(tmp_path, monkeypatch):
+    """The wrapper starts inside the stage directory, so relative paths must be made absolute
+    first (the default runs_dir is relative)."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "runs" / "job" / "05_prod").mkdir(parents=True)
+    stage_dir = Path("runs") / "job" / "05_prod"
+    launch_wrapper(stage_dir, [sys.executable, "-c", "print('rel')"], dict(os.environ),
+                   ledger_path=Path("runs") / "job" / "provenance.jsonl", stage="prod",
+                   max_wall_hours=1.0)
+    absolute = tmp_path / "runs" / "job" / "05_prod"
+    for _ in range(150):
+        if (absolute / "run.exit").exists():
+            break
+        time.sleep(0.1)
+    assert (absolute / "run.exit").read_text(encoding="utf-8").strip() == "0", (
+        (absolute / "wrapper.err").read_text(encoding="utf-8"))
+    assert [r["event"] for r in Ledger(tmp_path / "runs" / "job" / "provenance.jsonl").records()
+            ] == ["start", "end"]

@@ -138,21 +138,28 @@ def launch_wrapper(stage_dir: Path, argv: list[str], env: Mapping[str, str], *, 
     A preliminary ``run.json`` (``launching``) is written first so a status call never sees a
     half-started run.
     """
-    stage_dir = Path(stage_dir)
+    # the wrapper starts inside the stage directory, so every path it receives must be absolute
+    stage_dir = Path(stage_dir).resolve()
+    ledger_path = Path(ledger_path).resolve()
     update_run_json(stage_dir, lambda d: d.update(
         state="launching", launched_at=time.time(), argv=argv, samples=[]))
     command = [sys.executable, "-m", "simagent.core.mdrun_wrapper", str(stage_dir),
                json.dumps(argv), "--ledger", str(ledger_path), "--stage", stage,
                "--max-wall-hours", repr(max_wall_hours)]
+    # a wrapper that dies before it can write run.json leaves its traceback in wrapper.err
+    log = open(stage_dir / "wrapper.err", "wb")  # noqa: SIM115 - closed below, after the spawn
     options: dict[str, Any] = {"cwd": str(stage_dir), "env": dict(env), "close_fds": True,
                                "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
-                               "stderr": subprocess.DEVNULL}
+                               "stderr": log}
     if sys.platform == "win32":
         options["creationflags"] = (subprocess.DETACHED_PROCESS
                                     | subprocess.CREATE_NEW_PROCESS_GROUP)
     else:
         options["start_new_session"] = True
-    proc = subprocess.Popen(command, shell=False, **options)  # noqa: S603
+    try:
+        proc = subprocess.Popen(command, shell=False, **options)  # noqa: S603
+    finally:
+        log.close()
     update_run_json(stage_dir, lambda d: d.update(pid=proc.pid))
     return proc.pid
 

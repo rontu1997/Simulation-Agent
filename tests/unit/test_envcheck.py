@@ -18,6 +18,7 @@ def make_prefix(tmp_path: Path, *, data: bool = True, content: bytes = b"\x7fELF
     (prefix / "bin").mkdir(parents=True)
     binary = prefix / "bin" / "gmx"
     binary.write_bytes(content)
+    binary.chmod(0o755)  # the check requires an executable file; Windows ignores the bit
     if data:
         top = prefix / "share" / "gromacs" / "top"
         (top / "oplsaa.ff").mkdir(parents=True)
