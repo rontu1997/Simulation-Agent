@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from simagent.agent.diagnostician import Diagnosis, Diagnostician
+from simagent.agent.diagnostician import Diagnosis, Diagnostician, Evidence
 from simagent.config import Config
 
 POLL_FLOOR_S = 10.0
@@ -56,6 +56,10 @@ class _Stop(Exception):
     def __init__(self, outcome: Outcome) -> None:
         super().__init__(outcome.message)
         self.outcome = outcome
+
+
+class _Restart(Exception):
+    """A retry was applied; re-read the job and start the stage scan again."""
 
 
 def _describe(envelope: dict[str, Any]) -> str:
@@ -164,7 +168,10 @@ class Controller:
             if rounds > self._max_rounds:
                 return self._outcome("limit", stage, f"stopped after {self._max_rounds} rounds "
                                      "without finishing")
-            outcome = await self._advance(job_id, stage, job["data"])
+            try:
+                outcome = await self._advance(job_id, stage, job["data"])
+            except _Restart:
+                continue
             if outcome is not None:
                 return outcome
 
@@ -207,6 +214,8 @@ class Controller:
                 return self._outcome("escalate", stage,
                                      f"grompp stopped on warnings that were not acknowledged: "
                                      f"{texts}")
+            if code == "E_GROMPP_FAILED":
+                return await self._diagnose(job_id, stage, [])
             return self._outcome("escalate", stage, _describe(grompp))
         return None  # unreachable: the loop returns or continues
 
@@ -232,5 +241,40 @@ class Controller:
             return None
         failed = [c["name"] for c in result["data"]["checks"]
                   if c["status"] in ("fail", "no_receipt", "not_run")]
-        return self._outcome("escalate", stage,
-                             f"{stage} failed its gate: {', '.join(failed) or 'unknown check'}")
+        return await self._diagnose(job_id, stage, failed)
+
+    async def _diagnose(self, job_id: str, stage: str, failed_checks: list[str]) -> Outcome:
+        """Match the playbook and apply the next allowed retry (raising ``_Restart``), or
+        return the escalation for the researcher."""
+        self._emit("DIAGNOSE", job_id, stage)
+        job = await self._call("get_job", {"job_id": job_id})
+        data = job["data"] if job["ok"] else {}
+        causes = [f["cause"] for f in data.get("failures", []) if f["stage"] == stage][-1:]
+        texts: dict[str, str] = {}
+        for which in ("log", "grompp", "stderr"):
+            excerpt = await self._call("get_log_excerpt", {
+                "job_id": job_id, "stage": stage, "which": which, "lines": 40})
+            if excerpt["ok"]:
+                texts[which] = "\n".join(excerpt["data"]["lines"])
+        diagnosis = self.diagnostician.diagnose(
+            Evidence(stage, texts, failed_checks, causes, False), data.get("retries", []))
+        entry = diagnosis.entry
+        if entry.action == "retry" and diagnosis.step is not None:
+            step = diagnosis.step
+            applied = await self._call("write_mdp", {
+                "job_id": job_id, "stage": step.target,
+                "retry": {"key": step.key, "value": step.value}, "failing_stage": stage})
+            if not applied["ok"]:
+                return self._outcome(
+                    "escalate", stage, f"{entry.cause}. The server refused the automatic retry: "
+                    f"{_describe(applied)}", diagnosis)
+            used = sum(1 for r in data.get("retries", []) if r.get("failing_stage") == stage)
+            self.disclosures.append(
+                f"Retried {step.target} with {step.key}={step.value:g} after the {entry.id} "
+                f"failure in {stage} (automatic, {used + 1} of 2)")
+            self._emit("RETRY", job_id, stage, retry={"key": step.key, "value": step.value})
+            raise _Restart
+        matched = f" (matched: {diagnosis.matched})" if diagnosis.matched else ""
+        tail = " Automatic retries are used up." if diagnosis.exhausted else ""
+        return self._outcome("escalate", stage, f"{entry.cause}{matched}.{tail} {entry.hint}",
+                             diagnosis)
