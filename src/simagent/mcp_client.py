@@ -90,8 +90,11 @@ class McpSession:
         assert self._session is not None
         return list((await self._session.list_tools()).tools)
 
-    async def call(self, name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def call_result(self, name: str, args: dict[str, Any] | None = None) -> CallToolResult:
         assert self._session is not None
         result = await self._session.call_tool(name, args or {})
         assert isinstance(result, CallToolResult)
-        return parse_envelope(result)
+        return result
+
+    async def call(self, name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
+        return parse_envelope(await self.call_result(name, args))

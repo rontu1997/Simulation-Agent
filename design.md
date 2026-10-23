@@ -222,6 +222,7 @@ Allowed `stage` values form an enum (`build`, `em`, `nvt`, `npt`, `prod`, `analy
 | `E_ANALYSIS_INPUT` | `extract_energy`, `compute_rdf`, `compute_msd`, `analyze_timeseries`, `get_log_excerpt` (missing file, empty series, term not in the `.edr`) |
 | `E_CANCELLED` | `validate_stage` (stage was cancelled) |
 | `E_TIMEOUT`, `E_DISK_FULL` | any tool that runs a command or writes files |
+| `E_INTERNAL` | any tool (an unexpected server exception; the message names the exception type only and the details go to `events.jsonl`) |
 
 `validate_stage` returns `ok: true` with `passed: false` when checks fail, and a `not_run` check when the stage never ran; a failed gate is a result, not a tool error. `cancel_run` with nothing running returns `ok: true, cancelled: false`. Error responses may carry `data` (for example the warning list). Every error carries a researcher-readable `hint`, for example "GROMACS could not find oplsaa.ff under <prefix>/share/gromacs/top. The server derives GMXDATA from `GMX_BIN`; `GMXLIB` may also point at extra force-field directories."
 

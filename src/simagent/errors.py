@@ -36,6 +36,7 @@ class ErrorCode(str, Enum):
     E_CANCELLED = "E_CANCELLED"
     E_TIMEOUT = "E_TIMEOUT"
     E_DISK_FULL = "E_DISK_FULL"
+    E_INTERNAL = "E_INTERNAL"
 
 
 class SimAgentError(Exception):
