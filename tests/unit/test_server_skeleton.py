@@ -8,7 +8,7 @@ from mcp.client.stdio import StdioServerParameters
 
 from simagent.mcp_client import McpSession
 
-TEST_SERVER = Path(__file__).resolve().parents[1] / "fakes" / "test_tools_server.py"
+TEST_SERVER = Path(__file__).resolve().parents[1] / "fakes" / "fake_tools_server.py"
 
 
 @pytest.fixture
