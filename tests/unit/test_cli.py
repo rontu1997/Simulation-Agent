@@ -31,7 +31,8 @@ class NoServer:
 
 
 @pytest.fixture(autouse=True)
-def no_server(monkeypatch):
+def no_server(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)  # never pick up a developer's real ./.env or config.yaml
     monkeypatch.setattr(cli, "McpSession", NoServer)
     monkeypatch.delenv("SIMAGENT_CONFIG", raising=False)
 
