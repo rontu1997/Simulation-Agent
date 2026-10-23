@@ -140,6 +140,15 @@ def final_message(outcome: Outcome, job: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _production_ns(job: dict[str, Any]) -> float:
+    """Planned production length in ns, from a ``get_job`` data dict."""
+    for stage in job["plan"]["stages"]:
+        if stage["name"] == "prod":
+            params = stage["params"]
+            return float(params["nsteps"] * params["dt"] / 1000)
+    return 0.0
+
+
 def _clock(seconds: float) -> str:
     whole = int(seconds)
     return f"{whole // 3600:02d}:{whole % 3600 // 60:02d}:{whole % 60:02d}"
@@ -285,7 +294,10 @@ class Session:
     async def _ask_questions(self, questions: Sequence[Question]) -> str | None:
         lines = ["Details I need (my proposal in brackets):"]
         lines += [f" {i}. {q.text} [{q.proposal}]" for i, q in enumerate(questions, 1)]
-        await self._say("\n".join(lines))
+        block = "\n".join(lines)
+        await self._say(block)
+        if self.convo is not None:
+            self.convo.note_assistant(block)
         return await self._ask("> ")
 
     async def _plan_and_run(self, request: dict[str, Any]) -> Outcome | None:
@@ -299,7 +311,8 @@ class Session:
             await self._say(f"Note: {warning}")
         return await self._approve_and_run(prepared, auto=False)
 
-    async def run_request(self, request: dict[str, Any], *, auto_approve: bool) -> Outcome:
+    async def run_request(self, request: dict[str, Any], *, auto_approve: bool,
+                          long_run_confirmed: bool = False) -> Outcome:
         """Plan, approve, and run a finished request (the non-interactive path)."""
         try:
             prepared = await prepare_job(self.tools, request)
@@ -309,17 +322,28 @@ class Session:
         self.job_id = prepared.job_id
         for warning in prepared.warnings:
             await self._say(f"Note: {warning}")
-        outcome = await self._approve_and_run(prepared, auto=auto_approve)
+        outcome = await self._approve_and_run(prepared, auto=auto_approve,
+                                              long_run_confirmed=long_run_confirmed)
         return outcome or Outcome("cancelled", None, "the plan was not approved")
 
-    async def _approve_and_run(self, prepared: Prepared, *, auto: bool) -> Outcome | None:
+    async def _approve_and_run(self, prepared: Prepared, *, auto: bool,
+                               long_run_confirmed: bool = False) -> Outcome | None:
         while True:
             job = await self.tools.call("get_job", {"job_id": prepared.job_id})
             if not job["ok"]:
                 await self._say(_failure_text(job))
                 return None
             await self._say(render_plan(job["data"]))
+            long_ns = _production_ns(job["data"])
+            limit = self.cfg.workflow.max_production_ns_without_confirm
+            is_long = long_ns > limit
+            confirmed = long_run_confirmed
             mode = "auto"
+            if is_long and auto and not confirmed:
+                message = (f"The planned production run is {long_ns:g} ns, above the {limit:g} "
+                           "ns limit. Pass --confirm-long-run to approve it automatically.")
+                await self._say(message)
+                return Outcome("failed", None, message)
             if not auto:
                 answer = await self._ask("Approve? [y/n/edit] ")
                 reply = (answer or "").strip().lower()
@@ -334,9 +358,17 @@ class Session:
                     await self._say("Please answer y, n, or edit.")
                     continue
                 mode = "interactive"
+                if is_long and not confirmed:
+                    sure = await self._ask(
+                        f"This is a {long_ns:g} ns production run (above the {limit:g} ns "
+                        "limit). Confirm the long run? [y/n] ")
+                    if sure is None or sure.strip().lower() not in YES:
+                        await self._say(f"Not approved. Job {prepared.job_id} stays planned.")
+                        return None
+                    confirmed = True
             try:
                 await record_plan_approval(self.tools, self.token, prepared.job_id, mode,
-                                           shown=job["data"])
+                                           shown=job["data"], long_run_confirmed=confirmed)
             except PlanError as exc:
                 await self._say(str(exc))
                 return None
@@ -443,8 +475,15 @@ class Session:
                 if self._answer is not None and not self._answer.done():
                     self._answer.set_result(None)
                 return
+            stripped = line.strip()
             if self._answer is not None and not self._answer.done():
-                self._answer.set_result(line)
+                if stripped not in ("/quit", "/cancel"):
+                    self._answer.set_result(line)
+                    continue
+                if stripped == "/cancel":
+                    self._answer.set_result(None)  # the prompt gets no answer
+                if not await self.handle_command(stripped):
+                    return
             elif line.strip().startswith("/"):
                 if not await self.handle_command(line.strip()):
                     return
@@ -454,6 +493,13 @@ class Session:
     # -- commands -----------------------------------------------------------------------------
 
     async def handle_command(self, line: str) -> bool:
+        try:
+            return await self._dispatch(line)
+        except Exception as exc:  # one failing command must not end the session
+            await self._say(f"Command failed: {type(exc).__name__}: {exc}")
+            return True
+
+    async def _dispatch(self, line: str) -> bool:
         name, _, argument = line.partition(" ")
         argument = argument.strip()
         if name == "/quit":
@@ -535,10 +581,18 @@ class Session:
         if not job_id:
             await self._say("Usage: /resume <job_id>")
             return
+        if self._controller is not None:
+            await self._say("A run is in progress. Cancel it or wait for it to finish, then "
+                            "/resume.")
+            return
         job = await self._job(job_id)
         if job is None:
             return
         self.job_id = job_id
+        if not job.get("plan"):
+            await self._say(f"Job {job_id} has no stored plan (planning did not finish). "
+                            "Describe the simulation again to start over.")
+            return
         prepared = Prepared(job_id, job["request"], str(job["plan_sha256"]), [],
                             str(job.get("execution_mode", "real")))
         if (job.get("approval") or {}).get("matches_plan"):

@@ -68,6 +68,7 @@ def test_run_request_file_yes_runs_to_done_with_auto_approval(env, capsys):
     assert code == 0, out
     data = job_json(tmp_path)
     assert data["approval"]["mode"] == "auto"
+    assert data["approval"]["plan_sha256"] == data["plan_sha256"]  # the hash that was shown
     assert [data["stage_status"][s] for s in ("em", "nvt", "npt", "prod")] == ["PASSED"] * 4
     assert "Run finished: all four stages passed" in out and "simulated" in out
     assert "Plan for" in out and "seed" in out
@@ -75,7 +76,7 @@ def test_run_request_file_yes_runs_to_done_with_auto_approval(env, capsys):
 
 
 @pytest.mark.anyio
-async def test_auto_approval_still_needs_a_matching_hash(env):
+async def test_the_server_refuses_a_stale_hash_and_a_wrong_token(env):
     tmp_path, binary = env
     params = make_params(tmp_path, binary=binary, token=TOKEN, SIMAGENT_ALLOW_FAKE="1")
     async with McpSession(params) as session:

@@ -93,9 +93,19 @@ class Conversation:
             messages.append({"role": "system",
                              "content": f"Job summary: {self.job_summary()}"})
         window = self.history[-CONTEXT_MESSAGES:]
-        while window and window[0]["role"] != "user":  # never start on an orphan tool message
+        while window and window[0]["role"] == "tool":  # never start on an orphan tool message
             window = window[1:]
+        if not any(m["role"] == "user" for m in window):
+            # a long tool chain pushed the question out of the window: keep it
+            last_user = next((m for m in reversed(self.history) if m["role"] == "user"), None)
+            if last_user is not None:
+                window = [last_user, *window]
         return messages + window
+
+    def note_assistant(self, text: str) -> None:
+        """Record something the program said to the researcher (the questions it asked), so the
+        model can read the researcher's reply in context."""
+        self.history.append({"role": "assistant", "content": text})
 
     def _halt_budget(self) -> TurnResult:
         budget = self.cfg.llm.token_budget

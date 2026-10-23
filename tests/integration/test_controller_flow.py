@@ -145,6 +145,11 @@ async def test_kill_and_resume(tmp_path):
         knobs(binary, FAKE_GMX_SLEEP_ONCE="prod:30")
         task = asyncio.ensure_future(controller(session, ResumeDecisions()).run(job_id))
         info = await wait_for_gmx_pid(job_dir, "05_prod")
+        checkpoint = Path(job_dir) / "05_prod" / "prod.cpt"
+        for _ in range(100):  # the fake writes its checkpoint just after it starts
+            if checkpoint.exists():
+                break
+            await asyncio.sleep(0.1)
         for pid in (info["gmx_pid"], info["pid"]):
             try:
                 os.kill(pid, signal.SIGKILL)

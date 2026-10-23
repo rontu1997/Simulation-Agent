@@ -258,6 +258,7 @@ class Controller:
             code = (grompp.get("error") or {}).get("code")
             if code == "E_GROMPP_FAILED" and unacknowledged and attempt == 0:
                 accepted = await self.decisions.acknowledge_warnings(job_id, unacknowledged)
+                self._check_cancel(stage)
                 if {w["id"] for w in unacknowledged} <= set(accepted):
                     continue
                 texts = "; ".join(f"{w['id']}: {w['text']}" for w in unacknowledged)
@@ -324,6 +325,7 @@ class Controller:
         if has_checkpoint is None:
             has_checkpoint = await self._has_checkpoint(job_id, stage)
         choice = await self.decisions.on_interrupted(job_id, stage, cause, has_checkpoint)
+        self._check_cancel(stage)
         if choice == "resume" and has_checkpoint:
             started = await self._call("run_mdrun", {
                 "job_id": job_id, "stage": stage, "resume": True})

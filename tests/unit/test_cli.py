@@ -1,5 +1,4 @@
 import asyncio
-import builtins
 import json
 import tomllib
 from pathlib import Path
@@ -153,17 +152,9 @@ def test_console_scripts_in_pyproject():
 
 
 @pytest.mark.anyio
-async def test_terminal_console_reads_lines_then_reports_end_of_input(monkeypatch, capsys):
-    lines = iter(["first", "second"])
-
-    def fake_input(prompt=""):
-        try:
-            return next(lines)
-        except StopIteration:
-            raise EOFError from None
-
-    monkeypatch.setattr(builtins, "input", fake_input)
-    console = cli.TerminalConsole()
+async def test_terminal_console_reads_lines_then_reports_end_of_input(capsys):
+    lines = iter(["first", "second", None])
+    console = cli.TerminalConsole(reader=lambda: next(lines))
     await console.say("hello")
     assert await console.ask("> ") == "first"
     assert await console.ask("> ") == "second"
@@ -173,19 +164,16 @@ async def test_terminal_console_reads_lines_then_reports_end_of_input(monkeypatc
 
 
 @pytest.mark.anyio
-async def test_a_cancelled_ask_does_not_lose_the_next_line(monkeypatch):
-    gate = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    lines = ["kept"]
+async def test_a_cancelled_ask_does_not_lose_the_next_line():
+    import threading
+    gate = threading.Event()
+    lines = ["kept", None]
 
-    def slow_input(prompt=""):
-        asyncio.run_coroutine_threadsafe(gate.wait(), loop).result(timeout=5)
-        if not lines:
-            raise EOFError
+    def slow_reader():
+        gate.wait(timeout=5)
         return lines.pop(0)
 
-    monkeypatch.setattr(builtins, "input", slow_input)
-    console = cli.TerminalConsole()
+    console = cli.TerminalConsole(reader=slow_reader)
     first = asyncio.ensure_future(console.ask("> "))
     await asyncio.sleep(0.05)
     first.cancel()
@@ -193,6 +181,68 @@ async def test_a_cancelled_ask_does_not_lose_the_next_line(monkeypatch):
         await first
     gate.set()
     assert await asyncio.wait_for(console.ask("> "), timeout=5) == "kept"
+
+
+def test_fd_line_reader_splits_lines_and_reports_end_of_input():
+    import os
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"alpha\nbeta\ngam")
+    os.write(write_fd, b"ma\r\nlast-no-newline")
+    os.close(write_fd)
+    reader = cli.fd_line_reader(read_fd)
+    assert [reader(), reader(), reader(), reader(), reader()] == [
+        "alpha", "beta", "gamma", "last-no-newline", None]
+    os.close(read_fd)
+
+
+@pytest.mark.posix
+def test_the_process_exits_without_waiting_for_another_line_on_a_real_terminal():
+    """The reader thread must not keep a finished CLI alive (it hung on Linux terminals)."""
+    import os
+    import pty
+    import subprocess
+    import sys
+    script = (
+        "import asyncio\n"
+        "from simagent.cli import TerminalConsole\n"
+        "async def main():\n"
+        "    line = await TerminalConsole().ask('> ')\n"
+        "    print('got:' + str(line), flush=True)\n"
+        "asyncio.run(main())\n")
+    master, slave = pty.openpty()
+    proc = subprocess.Popen([sys.executable, "-c", script], stdin=slave, stdout=slave,
+                            stderr=slave, close_fds=True)
+    os.close(slave)
+    try:
+        os.write(master, b"hello\n")
+        try:
+            code = proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            pytest.fail("the process was still alive 15 s after it finished its work")
+        output = os.read(master, 4096).decode(errors="replace")
+    finally:
+        os.close(master)
+    assert code == 0 and "got:hello" in output
+
+
+def long_request(prod_ns: float) -> dict[str, Any]:
+    request = good_request()
+    request["protocol"]["prod_ns"] = prod_ns
+    return request
+
+
+def test_a_long_run_with_yes_needs_the_explicit_flag(tmp_path, capsys):
+    path = write(tmp_path, long_request(20.0))
+    assert cli.main(["run", "--request-file", path, "--yes"]) == 2
+    assert "--confirm-long-run" in capsys.readouterr().err
+
+
+def test_the_long_run_flag_lets_it_reach_the_server(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "McpSession", FailingSession)
+    path = write(tmp_path, long_request(20.0))
+    assert cli.main(["run", "--request-file", path, "--yes", "--confirm-long-run"]) == 3
 
 
 @pytest.fixture

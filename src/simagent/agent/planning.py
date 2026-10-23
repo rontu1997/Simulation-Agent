@@ -196,14 +196,18 @@ def render_plan(job: dict[str, Any]) -> str:
 
 
 async def record_plan_approval(tools: ToolCaller, token: str, job_id: str, mode: str, *,
-                               shown: dict[str, Any] | None = None) -> str:
+                               shown: dict[str, Any] | None = None,
+                               long_run_confirmed: bool = False) -> str:
     """Record approval for the plan hash of the ``get_job`` read that was shown (``shown``), or of
     a fresh read. The token only ever goes to the server."""
     job = shown if shown is not None else await _call(tools, "get_job", {"job_id": job_id})
     digest = str(job["plan_sha256"])
-    envelope = await tools.call("record_approval", {
+    args: dict[str, Any] = {
         "job_id": job_id, "approval_token": token, "kind": "plan", "plan_sha256": digest,
-        "mode": mode})
+        "mode": mode}
+    if long_run_confirmed:
+        args["long_run_confirmed"] = True
+    envelope = await tools.call("record_approval", args)
     if not envelope["ok"]:
         raise _failure("approval", envelope)
     return digest

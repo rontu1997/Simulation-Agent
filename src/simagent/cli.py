@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import builtins
 import json
+import os
 import secrets
 import sys
 import threading
@@ -38,14 +38,46 @@ def load_system_prompt() -> str:
         encoding="utf-8")
 
 
+def fd_line_reader(fd: int) -> Callable[[], str | None]:
+    """A blocking line reader over a file descriptor, ``None`` at end of input.
+
+    It uses ``os.read``, not ``input()``: a thread blocked in ``input()`` holds the C stdio lock,
+    and on a Linux terminal that makes the interpreter hang at exit until the user presses Enter.
+    """
+    buffer = b""
+    ended = False
+
+    def read_line() -> str | None:
+        nonlocal buffer, ended
+        while True:
+            if b"\n" in buffer:
+                raw, _, buffer = buffer.partition(b"\n")
+                return raw.decode("utf-8", errors="replace").rstrip("\r")
+            if ended:
+                if buffer:
+                    raw, buffer = buffer, b""
+                    return raw.decode("utf-8", errors="replace").rstrip("\r")
+                return None
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                ended = True
+            buffer += chunk
+
+    return read_line
+
+
 class TerminalConsole:
     """Standard input and output. One daemon thread reads lines into a queue, so a cancelled
-    ``ask`` never loses the next line and a blocked read never keeps the process alive."""
+    ``ask`` never loses the next line, and a thread blocked in a read never keeps the process
+    alive."""
 
-    def __init__(self) -> None:
+    def __init__(self, reader: Callable[[], str | None] | None = None) -> None:
+        self._reader = reader
         self._queue: asyncio.Queue[str | None] | None = None
         self._ended = False
-        self._started = False
 
     async def say(self, text: str) -> None:
         print(text, flush=True)
@@ -54,13 +86,11 @@ class TerminalConsole:
         loop = asyncio.get_running_loop()
         self._queue = asyncio.Queue()
         queue = self._queue
+        read_line = self._reader or fd_line_reader(sys.stdin.fileno())
 
-        def reader() -> None:
+        def run() -> None:
             while True:
-                try:
-                    line: str | None = builtins.input()
-                except (EOFError, KeyboardInterrupt):
-                    line = None
+                line = read_line()
                 try:
                     loop.call_soon_threadsafe(queue.put_nowait, line)
                 except RuntimeError:  # the loop is gone
@@ -68,13 +98,12 @@ class TerminalConsole:
                 if line is None:
                     return
 
-        threading.Thread(target=reader, daemon=True).start()
-        self._started = True
+        threading.Thread(target=run, daemon=True).start()
 
     async def ask(self, prompt: str) -> str | None:
         if self._ended:
             return None
-        if not self._started:
+        if self._queue is None:
             self._start()
         assert self._queue is not None
         if prompt:
@@ -106,6 +135,8 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--request-file", required=True, help="a JSON request (design 3.1 shape)")
     run.add_argument("--yes", action="store_true",
                      help="approve the plan automatically (recorded as mode auto)")
+    run.add_argument("--confirm-long-run", action="store_true",
+                     help="also confirm a production run above the long-run limit")
     return parser
 
 
@@ -163,22 +194,28 @@ def _run_file(args: argparse.Namespace, cfg: Config) -> int:
                "pass --yes")
         return 2
     request = finalize(draft)
-    return asyncio.run(_run_async(cfg, request, args.yes))
+    limit = cfg.workflow.max_production_ns_without_confirm
+    if args.yes and request["protocol"]["prod_ns"] > limit and not args.confirm_long_run:
+        _error(f"the production run is {request['protocol']['prod_ns']:g} ns, above the "
+               f"{limit:g} ns limit: add --confirm-long-run to approve it automatically")
+        return 2
+    return asyncio.run(_run_async(cfg, request, args.yes, args.confirm_long_run))
 
 
-async def _run_async(cfg: Config, request: dict[str, Any], yes: bool) -> int:
+async def _run_async(cfg: Config, request: dict[str, Any], yes: bool,
+                     long_run_confirmed: bool) -> int:
     token = secrets.token_urlsafe(32)
     async with McpSession(server_params(_environment(), token)) as tools:
         session = Session(tools, None, cfg, make_console(), token,
                           interactive=sys.stdin.isatty(), sleep=_poll_sleep)
         if not await session.start():
             return 3
-        outcome: Outcome = await session.run_request(request, auto_approve=yes)
+        outcome: Outcome = await session.run_request(
+            request, auto_approve=yes, long_run_confirmed=long_run_confirmed)
     return 0 if outcome.status in ("done", "detached") else 1
 
 
 def _environment() -> dict[str, str]:
-    import os
     return dict(os.environ)
 
 

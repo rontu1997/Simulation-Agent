@@ -184,3 +184,14 @@ async def test_replan_rejects_unknown_fields():
     prepared = await prepare_job(prep_tools(), request_dict())
     with pytest.raises(PlanError, match="bogus"):
         await replan(prep_tools(), prepared, {"bogus": 1})
+
+
+@pytest.mark.anyio
+async def test_long_run_confirmation_is_passed_to_the_server_only_when_given():
+    job = stored_job(request_dict())
+    tools = FakeTools({"record_approval": ok({"approved_at": "now"})})
+    await record_plan_approval(tools, TOKEN, JOB_ID, "interactive", shown=job)
+    assert "long_run_confirmed" not in tools.args("record_approval")[0]
+    await record_plan_approval(tools, TOKEN, JOB_ID, "interactive", shown=job,
+                               long_run_confirmed=True)
+    assert tools.args("record_approval")[1]["long_run_confirmed"] is True

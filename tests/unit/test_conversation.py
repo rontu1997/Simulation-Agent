@@ -150,7 +150,8 @@ async def test_context_is_system_summary_and_last_12_messages():
     assert last[0] == {"role": "system", "content": "SYSTEM"}
     assert last[1]["role"] == "system" and "one paragraph about the job" in last[1]["content"]
     rest = last[2:]
-    assert len(rest) <= 12 and rest[0]["role"] == "user"
+    assert len(rest) <= 13 and rest[0]["role"] != "tool"
+    assert any(m["role"] == "user" for m in rest)
     assert rest[-1] == {"role": "user", "content": "question 19"} or rest[-1]["role"] == "tool"
 
 
@@ -212,3 +213,26 @@ def test_compact_caps_lines_field_length_and_total_size():
     assert len(out["data"]["lines"]) == 20 and len(out["data"]["blob"]) <= 2001
     huge = ok({f"k{i}": "y" * 1500 for i in range(20)})
     assert len(compact(huge)) <= 6000
+
+
+@pytest.mark.anyio
+async def test_a_long_tool_chain_never_loses_the_question_being_answered():
+    replies = [call("get_job", {"job_id": "j"}, f"c{i}") for i in range(10)] + [say("done")]
+    llm = StubLlm(replies)
+    result = await make(llm).turn("what happened to job j?")
+    assert result.text == "done"
+    for sent in llm.sent:
+        rest = [m for m in sent if m["role"] != "system"]
+        assert any(m["role"] == "user" and "what happened" in m["content"] for m in rest)
+        assert rest[0]["role"] != "tool"
+
+
+@pytest.mark.anyio
+async def test_notes_from_the_program_reach_the_model_as_assistant_messages():
+    llm = StubLlm([say("ok")])
+    convo = make(llm)
+    convo.note_assistant("Details I need: 1. temperature [300]")
+    await convo.turn("make it 310")
+    sent = llm.sent[0]
+    assert {"role": "assistant", "content": "Details I need: 1. temperature [300]"} in sent
+    assert sent[-1] == {"role": "user", "content": "make it 310"}

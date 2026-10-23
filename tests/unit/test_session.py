@@ -336,3 +336,132 @@ async def test_start_accepts_the_simulated_probe_text_the_real_server_returns():
     console = ScriptedConsole([])
     assert await make(server, console).start() is True
     assert "skipped (simulated)" in console.transcript and "simulated mode" in console.transcript
+
+
+def long_run_request(prod_ns=20.0):
+    from simagent.agent.request import RequestDraft, finalize
+    values = {"n_molecules": 1000, "water_model": "tip4p", "force_field": "oplsaa",
+              "temperature_K": 300.0, "pressure_bar": 1.0, "prod_ns": prod_ns}
+    return finalize(RequestDraft(values, {k: "user" for k in values}))
+
+
+def plan_approvals(server):
+    return [a for a in server.args_of("record_approval") if a["kind"] == "plan"]
+
+
+@pytest.mark.anyio
+async def test_a_long_run_asks_for_an_explicit_confirmation(tmp_path):
+    server = SessionServer(tmp_path)
+    console = ScriptedConsole([("Approve?", "y"), ("long run", "y")], release_on="Run finished")
+    session = make(server, console)
+    outcome = await session.run_request(long_run_request(), auto_approve=False)
+    assert outcome.status == "done"
+    assert plan_approvals(server)[0]["long_run_confirmed"] is True
+
+
+@pytest.mark.anyio
+async def test_declining_the_long_run_confirmation_does_not_approve(tmp_path):
+    server = SessionServer(tmp_path)
+    console = ScriptedConsole([("Approve?", "y"), ("long run", "n")])
+    outcome = await make(server, console).run_request(long_run_request(), auto_approve=False)
+    assert plan_approvals(server) == [] and "run_mdrun" not in server.names()
+    assert outcome.status == "cancelled"
+
+
+@pytest.mark.anyio
+async def test_a_long_run_with_automatic_approval_needs_the_explicit_flag(tmp_path):
+    server = SessionServer(tmp_path)
+    session = make(server, ScriptedConsole([]))
+    outcome = await session.run_request(long_run_request(), auto_approve=True)
+    assert outcome.status == "failed" and "--confirm-long-run" in outcome.message
+    assert plan_approvals(server) == []
+    confirmed = await session.run_request(long_run_request(), auto_approve=True,
+                                          long_run_confirmed=True)
+    assert confirmed.status == "done"
+    assert plan_approvals(server)[0]["long_run_confirmed"] is True
+
+
+@pytest.mark.anyio
+async def test_a_short_run_never_asks_about_long_runs(tmp_path):
+    server = SessionServer(tmp_path)
+    console = ScriptedConsole([("Approve?", "y")], release_on="Run finished")
+    await make(server, console).run_request(long_run_request(1.0), auto_approve=False)
+    assert "long run" not in console.transcript
+    assert "long_run_confirmed" not in plan_approvals(server)[0]
+
+
+@pytest.mark.anyio
+async def test_the_questions_the_program_asked_reach_the_model(tmp_path):
+    server = SessionServer(tmp_path)
+    llm = StubLlm([submit(n_molecules=1000, water_model="tip4p"), say("noted")])
+    inputs = ["run waters", ("Details I need", "make it 310 K and 2 bar"),
+              ("Details I need", "no")]
+    await finish_conversation(server, inputs, llm, release=None)
+    follow_up = next(m for m in llm.sent if any(
+        x["role"] == "user" and "310 K" in x["content"] for x in m))
+    asked = [x for x in follow_up if x["role"] == "assistant"
+             and "Details I need" in (x["content"] or "")]
+    assert asked and "temperature" in asked[0]["content"]
+
+
+@pytest.mark.anyio
+async def test_resume_is_refused_while_a_run_is_in_progress():
+    server = SessionServer(statuses={"em": "PASSED", "nvt": "PASSED", "npt": "PASSED",
+                                     "prod": "RUNNING"}, hold=True)
+    console = ScriptedConsole([("[S5 prod]", "/resume other-job"),
+                               ("run is in progress", "/cancel")], release_on="never printed")
+    session = Session(server, None, load_config(env={}), console, TOKEN, poll_interval_s=10.0)
+    outcome = await asyncio.wait_for(session.execute(JOB_ID), timeout=8)
+    assert outcome.status == "cancelled"
+    assert "run is in progress" in console.transcript
+    assert len(server.args_of("get_job")) <= 6  # no nested run fetched another job
+
+
+@pytest.mark.anyio
+async def test_quit_at_a_prompt_detaches_instead_of_answering_no(tmp_path):
+    warning = {"id": "w1", "text": "a grompp warning", "source": "topol.top:3",
+               "acknowledged": False}
+    server = SessionServer(tmp_path, warnings=[warning])
+    llm = StubLlm([submit(n_molecules=1000, water_model="tip4p"), say("ok")])
+    inputs = [*FULL_SCRIPT, ("Approve?", "y"), ("Accept it", "/quit")]
+    session, console = await finish_conversation(server, inputs, llm, release=None)
+    assert "Leaving job" in console.transcript and "Run finished" not in console.transcript
+    assert [a for a in server.args_of("record_approval") if a["kind"] == "warnings"] == []
+
+
+@pytest.mark.anyio
+async def test_cancel_at_a_prompt_cancels_instead_of_answering_no(tmp_path):
+    warning = {"id": "w1", "text": "a grompp warning", "source": "topol.top:3",
+               "acknowledged": False}
+    server = SessionServer(tmp_path, warnings=[warning])
+    llm = StubLlm([submit(n_molecules=1000, water_model="tip4p"), say("ok")])
+    inputs = [*FULL_SCRIPT, ("Approve?", "y"), ("Accept it", "/cancel")]
+    session, console = await finish_conversation(server, inputs, llm)
+    assert "Run finished: cancelled" in console.transcript
+
+
+@pytest.mark.anyio
+async def test_resume_of_a_job_with_no_plan_says_so_instead_of_crashing(tmp_path):
+    server = SessionServer(tmp_path)
+    server.plan = None
+    server.request = {"system": {}}
+    console = ScriptedConsole([f"/resume {JOB_ID}", "/status"])
+    session = make(server, console)
+    await session.start()
+    await session.chat()
+    assert "no stored plan" in console.transcript.lower()
+    assert "Job" in console.transcript  # the session carried on to /status
+
+
+@pytest.mark.anyio
+async def test_a_failing_command_does_not_end_the_session(tmp_path):
+    server = SessionServer(tmp_path)
+
+    async def broken(args):
+        raise BrokenPipeError("server gone")
+
+    server._list_jobs = broken
+    console = ScriptedConsole(["/jobs", "/bogus"])
+    session = make(server, console)
+    await session.chat()
+    assert "Command failed" in console.transcript and "Unknown command" in console.transcript

@@ -28,7 +28,7 @@ Priority: P0 must for v1, P1 should, P2 could. Dependencies list task numbers (`
 | M1 Foundation | Done on the authoring host | TASK-010 to 016 and 018 done; TASK-017 CI file written, first CI run pending; TASK-013 and TASK-014 live checks pending (real binary, live endpoint) |
 | M2 MCP server | Done on the authoring host | TASK-019 to 028, 035, 050, 060, 068 done. Suite on Windows: 326 passed, 8 skipped; on Linux (WSL Ubuntu): 330 passed, 4 skipped. Pending on the Linux host with GROMACS: `test_real_flow_em` (T-INT-01 slice), `test_build_real`, `test_envcheck_real`; the nvt, npt, prod gates are untested against a real run |
 | M3 Workflow engine | Done on the authoring host | TASK-030, 031, 032 done (Windows 396 passed, 16 skipped; Linux WSL 407 passed, 5 skipped). TASK-034 (verify playbook and gate strings against real GROMACS) still needs the Linux host |
-| M4 Agent and CLI | Done on the authoring host | TASK-040 to 045 done (Windows 476 passed, 21 skipped; Linux WSL 492 passed, 5 skipped). Never run against the live gpt6-luna endpoint |
+| M4 Agent and CLI | Done on the authoring host | TASK-040 to 045 done (Windows 492 passed, 22 skipped; Linux WSL 509 passed, 5 skipped). Never run against the live gpt6-luna endpoint |
 | M5 Analysis and report | Not started | |
 | M6 Hardening and acceptance | Not started | |
 
