@@ -12,8 +12,12 @@ dependencies = [
     "jinja2",      # MDP templates
     "numpy",       # analysis
     "matplotlib",  # plots
-    "filelock",    # memory file locking
+    "filelock",    # file locking for the ledger, job.json, and memory
 ]
+
+[project.scripts]
+simagent = "simagent.cli:main"
+gmx-mcp = "simagent.mcp_server.app:main"
 
 [dependency-groups]
 dev = [
@@ -24,8 +28,31 @@ dev = [
     "types-PyYAML",
 ]
 
-# No source package exists yet (tracker TASK-010), so uv installs dependencies only.
-# TASK-010 adds a [build-system] table (for example hatchling with a src/ layout) and
-# [project.scripts] entries for `simagent` and `gmx-mcp`, then removes `package = false`.
-[tool.uv]
-package = false
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/simagent"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# S602 and S605 forbid shell=True and os.system (NFR-01, RULE-X-01).
+select = ["E", "F", "I", "S602", "S605"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "posix: needs POSIX features (process groups, /proc, executing a #! script); skipped on Windows",
+    "real_gmx: needs the real GROMACS binary named by GMX_BIN; skipped otherwise",
+    "slow: long-running test",
+]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+disallow_untyped_defs = true
+warn_unused_ignores = true
