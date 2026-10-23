@@ -12,7 +12,7 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
 from simagent.config import Config
-from simagent.mcp_server import tools_env  # noqa: F401  (registers tool 1)
+from simagent.mcp_server import tools_env, tools_job  # noqa: F401  (register tools)
 from simagent.mcp_server.registry import TOOLS, ServerContext, dispatch
 
 
