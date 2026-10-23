@@ -50,6 +50,7 @@ class Outcome:
     message: str
     diagnosis: Diagnosis | None = None
     disclosures: list[str] = field(default_factory=list)
+    excerpts: dict[str, str] = field(default_factory=dict)  # the log tails the diagnosis read
 
 
 class _Stop(Exception):
@@ -86,6 +87,8 @@ class Controller:
         self._calls = 0
         self._cancelled = False
         self._wake = asyncio.Event()
+        self._cancel_lock = asyncio.Lock()
+        self._cancel_sent: dict[str, dict[str, Any]] = {}
         self.disclosures: list[str] = []
 
     # -- plumbing ---------------------------------------------------------------------------
@@ -94,11 +97,15 @@ class Controller:
         if self._on_event is not None:
             self._on_event({"state": state, "job_id": job_id, "stage": stage, **extra})
 
-    async def _call(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
-        if self._calls >= self._max_calls:
-            raise _Stop(Outcome("limit", None, f"stopped after {self._calls} tool calls "
-                                "(the controller's call limit)"))
-        self._calls += 1
+    async def _call(self, name: str, args: dict[str, Any], *,
+                    counted: bool = True) -> dict[str, Any]:
+        """Call a tool. Status polls and cancels are not counted: a long run polls for hours,
+        and a cancel must work after the budget is spent."""
+        if counted:
+            if self._calls >= self._max_calls:
+                raise _Stop(Outcome("limit", None, f"stopped after {self._calls} tool calls "
+                                    "(the controller's call limit)"))
+            self._calls += 1
         try:
             envelope = await self.tools.call(name, args)
         except Exception as exc:  # the server went away or the transport broke
@@ -119,22 +126,26 @@ class Controller:
             pass
 
     def _outcome(self, status: str, stage: str | None, message: str,
-                 diagnosis: Diagnosis | None = None) -> Outcome:
-        return Outcome(status, stage, message, diagnosis, list(self.disclosures))
+                 diagnosis: Diagnosis | None = None,
+                 excerpts: dict[str, str] | None = None) -> Outcome:
+        return Outcome(status, stage, message, diagnosis, list(self.disclosures),
+                       dict(excerpts or {}))
 
     # -- public -----------------------------------------------------------------------------
 
     async def run(self, job_id: str) -> Outcome:
         self._cancelled = False
         self._wake.clear()
+        self._cancel_sent = {}
+        self._calls = 0
         self.disclosures = []
         try:
             outcome = await self._run(job_id)
         except _Stop as stop:
             outcome = stop.outcome
             outcome.disclosures = list(self.disclosures)
-        state = {"done": "DONE", "escalate": "ESCALATE", "cancelled": "CANCELLED"}.get(
-            outcome.status, "FAILED")
+        state = {"done": "DONE", "escalate": "ESCALATE", "cancelled": "CANCELLED",
+                 "limit": "LIMIT"}.get(outcome.status, "FAILED")
         self._emit(state, job_id, outcome.stage, message=outcome.message)
         return outcome
 
@@ -142,12 +153,40 @@ class Controller:
         """Stop the running stage now: wake the poll sleep, then call ``cancel_run``."""
         self._cancelled = True
         self._wake.set()
-        job = await self._call("get_job", {"job_id": job_id})
+        job = await self._call("get_job", {"job_id": job_id}, counted=False)
+        if not job["ok"]:
+            return job
         running = next((s for s in PROCESS_STAGES
-                        if job["ok"] and job["data"]["stage_status"].get(s) == "RUNNING"), None)
+                        if job["data"]["stage_status"].get(s) == "RUNNING"), None)
         if running is None:
             return {"ok": True, "data": {"cancelled": False, "signal_sent": None}, "error": None}
-        return await self._call("cancel_run", {"job_id": job_id, "stage": running})
+        return await self._send_cancel(job_id, running)
+
+    async def _send_cancel(self, job_id: str, stage: str) -> dict[str, Any]:
+        """Send ``cancel_run`` for ``stage`` once, however many callers ask."""
+        async with self._cancel_lock:
+            if stage not in self._cancel_sent:
+                result = await self._call("cancel_run", {"job_id": job_id, "stage": stage},
+                                          counted=False)
+                if result["ok"]:
+                    self._cancel_sent[stage] = result
+                return result
+            return self._cancel_sent[stage]
+
+    async def _finish_cancel(self, job_id: str, stage: str) -> Outcome:
+        """The researcher cancelled: make sure the stage really stopped before saying so."""
+        await self._send_cancel(job_id, stage)
+        job = await self._call("get_job", {"job_id": job_id}, counted=False)
+        if job["ok"] and job["data"]["stage_status"].get(stage) == "RUNNING":
+            return self._outcome("failed", stage, f"{stage} is still running after the cancel "
+                                 "request; check it with get_run_status")
+        return self._outcome("cancelled", stage, f"{stage} was cancelled")
+
+    def _check_cancel(self, stage: str | None) -> None:
+        """Before starting anything new: a cancel that arrived outside a poll stops the run."""
+        if self._cancelled:
+            raise _Stop(self._outcome("cancelled", stage, "the run was cancelled before the "
+                                      "next step started"))
 
     # -- the loop ---------------------------------------------------------------------------
 
@@ -161,6 +200,11 @@ class Controller:
             if not job["ok"]:
                 return self._outcome("failed", None, _describe(job))
             statuses = job["data"]["stage_status"]
+            if self._cancelled:
+                running = next((s for s in PROCESS_STAGES if statuses[s] == "RUNNING"), None)
+                if running is not None:
+                    return await self._finish_cancel(job_id, running)
+                return self._outcome("cancelled", None, "the run was cancelled")
             stage = next((s for s in PROCESS_STAGES if statuses[s] != "PASSED"), None)
             if stage is None:
                 return self._outcome("done", "prod", "em, nvt, npt, and prod passed their gates")
@@ -181,14 +225,18 @@ class Controller:
         args = {"job_id": job_id, "stage": stage}
         self._emit("EXECUTE", job_id, stage)
         if status == "PENDING":
+            self._check_cancel(stage)
             stopped = await self._prepare(job_id, stage)
             if stopped is not None:
                 return stopped
             status = "READY"
         if status == "READY":
+            self._check_cancel(stage)
             started = await self._call("run_mdrun", {**args, "resume": False})
             if not started["ok"]:
                 return self._outcome("escalate", stage, _describe(started))
+        elif status == "GATING":  # the server stopped between the process and its gate
+            return await self._validate(job_id, stage)
         elif status in ("FAILED", "CANCELLED"):
             return await self._stopped_stage(job_id, stage, job, status)
         elif status != "RUNNING":
@@ -217,21 +265,23 @@ class Controller:
                                      f"grompp stopped on warnings that were not acknowledged: "
                                      f"{texts}")
             if code == "E_GROMPP_FAILED":
-                return await self._diagnose(job_id, stage, [])
+                return await self._diagnose(job_id, stage, [], phase="grompp")
             return self._outcome("escalate", stage, _describe(grompp))
         return None  # unreachable: the loop returns or continues
 
     async def _poll(self, job_id: str, stage: str) -> str:
         while True:
-            status = await self._call("get_run_status", {"job_id": job_id, "stage": stage})
+            status = await self._call("get_run_status", {"job_id": job_id, "stage": stage},
+                                      counted=False)
             if not status["ok"]:
                 raise _Stop(self._outcome("escalate", stage, _describe(status)))
             state = str(status["data"]["state"])
             if state in _ENDED:
                 return state
-            await self._wait(self._interval)
+            if not self._cancelled:
+                await self._wait(self._interval)
             if self._cancelled:
-                raise _Stop(self._outcome("cancelled", stage, f"{stage} was cancelled"))
+                raise _Stop(await self._finish_cancel(job_id, stage))
 
     async def _validate(self, job_id: str, stage: str) -> Outcome | None:
         result = await self._call("validate_stage", {"job_id": job_id, "stage": stage})
@@ -266,7 +316,8 @@ class Controller:
 
     async def _interrupted(self, job_id: str, stage: str, cause: str,
                            has_checkpoint: bool | None = None,
-                           diagnosis: Diagnosis | None = None) -> Outcome:
+                           diagnosis: Diagnosis | None = None,
+                           excerpts: dict[str, str] | None = None) -> Outcome:
         """The process died, timed out, or was cancelled: ask the researcher, then resume from
         the checkpoint or restart from grompp (always raising ``_Restart``), or stop."""
         if has_checkpoint is None:
@@ -289,9 +340,10 @@ class Controller:
             raise _Restart
         status = "cancelled" if cause == "cancelled" else "escalate"
         return self._outcome(status, stage, f"{stage} was interrupted ({cause}) and the run "
-                             "was stopped at your request", diagnosis)
+                             "was stopped at your request", diagnosis, excerpts)
 
-    async def _diagnose(self, job_id: str, stage: str, failed_checks: list[str]) -> Outcome:
+    async def _diagnose(self, job_id: str, stage: str, failed_checks: list[str],
+                        phase: str = "run") -> Outcome:
         """Match the playbook and apply the next allowed retry (raising ``_Restart``), or
         return the escalation for the researcher."""
         self._emit("DIAGNOSE", job_id, stage)
@@ -301,7 +353,9 @@ class Controller:
         died = bool(causes) and causes[0] in ("process_died", "timeout")
         has_checkpoint = await self._has_checkpoint(job_id, stage) if died else False
         texts: dict[str, str] = {}
-        for which in ("log", "grompp", "stderr"):
+        # grompp.out is only evidence for a grompp failure: after acknowledged warnings it still
+        # holds the old WARNING blocks and would outrank the real cause of an mdrun failure
+        for which in (("grompp",) if phase == "grompp" else ("log", "stderr")):
             excerpt = await self._call("get_log_excerpt", {
                 "job_id": job_id, "stage": stage, "which": which, "lines": 40})
             if excerpt["ok"]:
@@ -310,7 +364,8 @@ class Controller:
             Evidence(stage, texts, failed_checks, causes, has_checkpoint), data.get("retries", []))
         entry = diagnosis.entry
         if entry.id == "process_died":
-            return await self._interrupted(job_id, stage, causes[0], has_checkpoint, diagnosis)
+            return await self._interrupted(job_id, stage, causes[0], has_checkpoint, diagnosis,
+                                           texts)
         if entry.action == "retry" and diagnosis.step is not None:
             step = diagnosis.step
             applied = await self._call("write_mdp", {
@@ -319,7 +374,7 @@ class Controller:
             if not applied["ok"]:
                 return self._outcome(
                     "escalate", stage, f"{entry.cause}. The server refused the automatic retry: "
-                    f"{_describe(applied)}", diagnosis)
+                    f"{_describe(applied)}", diagnosis, texts)
             used = sum(1 for r in data.get("retries", []) if r.get("failing_stage") == stage)
             self.disclosures.append(
                 f"Retried {step.target} with {step.key}={step.value:g} after the {entry.id} "
@@ -329,4 +384,4 @@ class Controller:
         matched = f" (matched: {diagnosis.matched})" if diagnosis.matched else ""
         tail = " Automatic retries are used up." if diagnosis.exhausted else ""
         return self._outcome("escalate", stage, f"{entry.cause}{matched}.{tail} {entry.hint}",
-                             diagnosis)
+                             diagnosis, texts)

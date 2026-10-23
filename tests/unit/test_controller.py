@@ -148,7 +148,7 @@ async def test_polling_floor():
 @pytest.mark.anyio
 async def test_cancel_during_poll_sleep():
     tools = FakeTools(base_script(
-        get_job=[ok(job_data(prod="RUNNING"))],
+        get_job=[ok(job_data(prod="RUNNING")), ok(job_data(prod="CANCELLED"))],
         get_run_status=[ok({"state": "running"})],
         cancel_run=[ok({"cancelled": True, "signal_sent": "SIGTERM"})]))
     controller = Controller(tools, load_config(env={}), poll_interval_s=10.0)  # real sleeper
@@ -181,9 +181,11 @@ async def test_tool_failure_stops_the_run(failure):
 @pytest.mark.anyio
 async def test_call_budget_stops_with_limit():
     tools = FakeTools(base_script(get_job=[ok(job_data(em="READY"))],
-                                  run_mdrun=[ok({"pid": 1})]))
+                                  run_mdrun=[ok({"pid": 1})],
+                                  get_run_status=[ok({"state": "finished"})],
+                                  validate_stage=[ok({"passed": True, "checks": []})]))
     outcome = await make(tools, max_tool_calls=3).run("j1")
-    assert outcome.status == "limit" and len(tools.calls) == 3
+    assert outcome.status == "limit" and len(tools.calls) == 4  # the poll is not counted
 
 
 @pytest.mark.anyio
@@ -255,7 +257,8 @@ class FakeServer:
 
     def __init__(self, statuses=None, runs=None, retries=(), grompp_fail=None,
                  refuse_retry=None, forget_retries=False, checkpoint=False, failures=(),
-                 current=None):
+                 current=None, running_polls=0, hold=False, grompp_text=None, cancel_delay=0.0,
+                 cancel_ignored=False):
         self.status = {"build": "PASSED", "analysis": "PENDING",
                        **{s: "PENDING" for s in PROCESS}, **(statuses or {})}
         self.runs = {k: list(v) for k, v in (runs or {}).items()}
@@ -268,6 +271,13 @@ class FakeServer:
         self.attempts = {s: 0 for s in PROCESS}
         self.current: dict[str, Any] = dict(current or {})
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.running_polls = running_polls
+        self.hold = hold
+        self.grompp_text = grompp_text
+        self.cancel_delay = cancel_delay
+        self.cancel_ignored = cancel_ignored
+        self.cancel_finished = False
+        self.before: dict[str, Any] = {}
 
     def names(self):
         return [n for n, _ in self.calls]
@@ -277,6 +287,8 @@ class FakeServer:
 
     async def call(self, name, args):
         self.calls.append((name, dict(args)))
+        if name in self.before:
+            await self.before[name](args)
         return await getattr(self, f"_{name}")(args)
 
     async def _gmx_check_environment(self, args):
@@ -325,6 +337,11 @@ class FakeServer:
         return ok({"pid": 1, "log_path": f"{stage}.log"})
 
     async def _get_run_status(self, args):
+        if self.hold and self.status[args["stage"]] == "RUNNING":
+            return ok({"state": "running"})
+        if self.running_polls > 0:
+            self.running_polls -= 1
+            return ok({"state": "running"})
         failing = self.current.get(args["stage"])
         return ok({"state": "died" if failing else "finished",
                    "exit_code": 1 if failing else 0, "log_tail": []})
@@ -343,6 +360,8 @@ class FakeServer:
         stage, which = args["stage"], args["which"]
         if which == "grompp" and stage in self.grompp_fail:
             return ok({"lines": self.grompp_fail[stage].splitlines(), "path": "grompp.out"})
+        if which == "grompp" and self.grompp_text:
+            return ok({"lines": self.grompp_text.splitlines(), "path": "grompp.out"})
         failing = self.current.get(stage) or {}
         key = {"stderr": "stderr", "log": "log"}.get(which)
         text = failing.get(key) if key else None
@@ -355,7 +374,11 @@ class FakeServer:
         return ok({"files": files})
 
     async def _cancel_run(self, args):
-        return ok({"cancelled": True, "signal_sent": "SIGTERM"})
+        await asyncio.sleep(self.cancel_delay)
+        if not self.cancel_ignored:
+            self.status[args["stage"]] = "CANCELLED"
+        self.cancel_finished = True
+        return ok({"cancelled": not self.cancel_ignored, "signal_sent": "SIGTERM"})
 
 
 SETTLE = "Water molecule starting at atom 17 can not be settled."
@@ -379,7 +402,7 @@ async def test_settle_failure_applies_the_first_step_and_reruns():
     assert "emtol=100" in outcome.disclosures[0] and "nvt" in outcome.disclosures[0]
     assert all(c["retry"]["key"] in ALLOWED_KEYS for c in retry_calls(server))
     reads = [a["which"] for a in server.args_of("get_log_excerpt")]
-    assert sorted(reads) == ["grompp", "log", "stderr"]
+    assert sorted(reads) == ["log", "stderr"]
 
 
 @pytest.mark.anyio
@@ -550,3 +573,141 @@ async def test_resume_counts_against_the_round_limit():
     outcome = await make(server, Decider(interrupted="resume"), max_rounds=5).run("j1")
     assert outcome.status == "limit"
     assert 1 <= len(server.args_of("run_mdrun")) <= 5
+
+
+# -- final review fixes (I1 to I5) ---------------------------------------------------
+
+async def _until(predicate, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "condition never became true"
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.anyio
+async def test_cancel_during_grompp_never_starts_mdrun():
+    server = FakeServer()
+    controller = make(server)
+
+    async def cancel_now(args):
+        await controller.cancel("j1")
+
+    server.before["run_grompp"] = cancel_now
+    outcome = await controller.run("j1")
+    assert outcome.status == "cancelled"
+    assert server.args_of("run_mdrun") == [] and server.args_of("cancel_run") == []
+
+
+@pytest.mark.anyio
+async def test_run_returns_cancelled_only_after_cancel_run_finished_and_stage_is_cancelled():
+    server = FakeServer(statuses={"em": "PASSED", "nvt": "PASSED", "npt": "PASSED",
+                                  "prod": "RUNNING"}, hold=True, cancel_delay=0.3)
+    controller = Controller(server, load_config(env={}), poll_interval_s=10.0)
+    task = asyncio.ensure_future(controller.run("j1"))
+    await _until(lambda: "get_run_status" in server.names())
+    await controller.cancel("j1")
+    outcome = await asyncio.wait_for(task, timeout=3)
+    assert outcome.status == "cancelled" and outcome.stage == "prod"
+    assert server.cancel_finished is True and server.status["prod"] == "CANCELLED"
+    assert len(server.args_of("cancel_run")) == 1
+
+
+@pytest.mark.anyio
+async def test_cancel_that_does_not_stop_the_stage_is_not_reported_as_cancelled():
+    server = FakeServer(statuses={"em": "PASSED", "nvt": "PASSED", "npt": "PASSED",
+                                  "prod": "RUNNING"}, hold=True, cancel_ignored=True)
+    controller = Controller(server, load_config(env={}), poll_interval_s=10.0)
+    task = asyncio.ensure_future(controller.run("j1"))
+    await _until(lambda: "get_run_status" in server.names())
+    await controller.cancel("j1")
+    outcome = await asyncio.wait_for(task, timeout=3)
+    assert outcome.status == "failed" and "prod" in outcome.message
+
+
+@pytest.mark.anyio
+async def test_cancel_during_validate_stops_before_the_next_stage():
+    server = FakeServer()
+    controller = make(server)
+
+    async def cancel_now(args):
+        await controller.cancel("j1")
+
+    server.before["validate_stage"] = cancel_now
+    outcome = await controller.run("j1")
+    assert outcome.status == "cancelled"
+    assert [a["stage"] for a in server.args_of("run_mdrun")] == ["em"]
+
+
+@pytest.mark.anyio
+async def test_cancel_reports_a_get_job_failure():
+    tools = FakeTools({"get_job": [err("E_JOB_NOT_FOUND", "no such job")]})
+    result = await make(tools).cancel("j1")
+    assert result["ok"] is False and result["error"]["code"] == "E_JOB_NOT_FOUND"
+
+
+@pytest.mark.anyio
+async def test_cancel_still_works_after_the_call_budget_is_spent():
+    tools = FakeTools(base_script(
+        get_job=[ok(job_data(em="READY")), ok(job_data(em="RUNNING"))],
+        run_mdrun=[ok({"pid": 1})], get_run_status=[ok({"state": "finished"})],
+        validate_stage=[ok({"passed": True, "checks": []})],
+        cancel_run=[ok({"cancelled": True, "signal_sent": "SIGTERM"})]))
+    controller = make(tools, max_tool_calls=3)
+    assert (await controller.run("j1")).status == "limit"
+    result = await controller.cancel("j1")
+    assert result["ok"] and "cancel_run" in tools.names()
+
+
+@pytest.mark.anyio
+async def test_polls_do_not_count_against_the_call_budget():
+    server = FakeServer(statuses={"em": "PASSED", "nvt": "PASSED", "npt": "PASSED",
+                                  "prod": "RUNNING"}, running_polls=600)
+    outcome = await make(server, max_tool_calls=40).run("j1")
+    assert outcome.status == "done"
+    assert server.names().count("get_run_status") == 601
+
+
+@pytest.mark.anyio
+async def test_the_call_budget_is_per_run_and_limit_has_its_own_event():
+    events: list[dict[str, Any]] = []
+    tools = FakeTools(base_script())
+    controller = make(tools, max_tool_calls=2, on_event=events.append)
+    assert (await controller.run("j1")).status == "done"
+    assert (await controller.run("j1")).status == "done"
+    stuck = FakeTools(base_script(get_job=[ok(job_data(em="READY"))],
+                                  run_mdrun=[ok({"pid": 1})],
+                                  get_run_status=[ok({"state": "finished"})],
+                                  validate_stage=[ok({"passed": True, "checks": []})]))
+    limited = make(stuck, max_tool_calls=3, on_event=events.append)
+    assert (await limited.run("j1")).status == "limit"
+    assert events[-1]["state"] == "LIMIT"
+
+
+@pytest.mark.anyio
+async def test_a_stage_found_in_gating_is_validated_not_escalated():
+    server = FakeServer(statuses={"em": "PASSED", "nvt": "GATING"})
+    outcome = await make(server).run("j1")
+    assert outcome.status == "done"
+    assert {"job_id": "j1", "stage": "nvt"} in server.args_of("validate_stage")
+    assert server.args_of("run_mdrun")[0]["stage"] == "npt"
+
+
+@pytest.mark.anyio
+async def test_stale_grompp_text_never_hides_an_mdrun_failure():
+    stale = "WARNING 1 [file topol.top, line 3]:\n  fake warning 1\nThere was 1 warning"
+    server = FakeServer(statuses={"em": "PASSED"}, runs={"nvt": [{"cause": "process_died"}]},
+                        grompp_text=stale)
+    outcome = await make(server).run("j1")
+    assert outcome.status == "escalate"
+    assert outcome.diagnosis is not None and outcome.diagnosis.entry.id == "process_died"
+    assert "grompp" not in [a["which"] for a in server.args_of("get_log_excerpt")]
+
+
+@pytest.mark.anyio
+async def test_escalation_carries_the_log_excerpts():
+    done = [{"key": "emtol", "value": 100.0, "stage": "em", "failing_stage": "nvt"},
+            {"key": "dt", "value": 0.001, "stage": "nvt", "failing_stage": "nvt"}]
+    server = FakeServer(statuses={"em": "PASSED"}, runs={"nvt": [SETTLE]}, retries=done)
+    outcome = await make(server).run("j1")
+    assert outcome.status == "escalate"
+    assert SETTLE in outcome.excerpts["stderr"] and "grompp" not in outcome.excerpts

@@ -202,3 +202,20 @@ async def test_resume_continuity_real(tmp_path):
                            capture_output=True, text=True, check=False)
     assert "Last frame" in check.stdout + check.stderr
     assert "1000.000" in check.stdout + check.stderr
+
+
+async def test_cancel_stops_a_running_stage_through_the_real_server(tmp_path):
+    binary, session = server(tmp_path)
+    async with session:
+        prepared = await prepare_approved_job(session)
+        job_id, job_dir = prepared["job_id"], prepared["created"]["job_dir"]
+        knobs(binary, FAKE_GMX_SLEEP_ONCE="prod:60")
+        runner = controller(session)
+        task = asyncio.ensure_future(runner.run(job_id))
+        await wait_for_gmx_pid(job_dir, "05_prod")
+        result = await runner.cancel(job_id)
+        outcome = await asyncio.wait_for(task, timeout=60)
+        job = await statuses(session, job_id)
+    assert result["ok"] and outcome.status == "cancelled" and outcome.stage == "prod"
+    assert job["stage_status"]["prod"] == "CANCELLED"
+    assert (Path(job_dir) / "05_prod" / "run.cancelled").exists()
