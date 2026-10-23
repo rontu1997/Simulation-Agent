@@ -66,7 +66,7 @@ def _coerce(name: str, value: Any, path: str | None = None) -> Any:
     return value if name in ("nvt_ps", "npt_ps") else float(value)
 
 
-def _parse_text(name: str, text: str) -> Any:
+def parse_value(name: str, text: str) -> Any:
     """Turn a proposal or an answer into a typed value."""
     text = text.strip()
     if name == "analyses":
@@ -145,7 +145,7 @@ def accept(draft: RequestDraft, questions: Sequence[Question]) -> RequestDraft:
     """The researcher said yes: each proposal becomes the value, origin ``user``."""
     values, origins = dict(draft.values), dict(draft.origins)
     for question in questions:
-        values[question.field] = _parse_text(question.field, question.proposal)
+        values[question.field] = parse_value(question.field, question.proposal)
         origins[question.field] = "user"
     return RequestDraft(values, origins)
 

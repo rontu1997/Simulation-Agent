@@ -87,6 +87,7 @@ def test_get_job_reports_state_without_secrets(tmp_path):
     assert before["plan_sha256"] == digest and before["plan"]["stages"][0]["id"] == "S1"
     assert before["stage_status"]["build"] == "PASSED" and before["job_status"] == "planned"
     assert before["summary"] is None and before["execution_mode"] == "real"
+    assert before["acknowledged_warnings"] == []
     record_approval_tool(ctx, RecordApprovalArgs(
         job_id=job_id, approval_token=TOKEN, kind="plan", plan_sha256=digest))
     after = get_job_tool(ctx, GetJobArgs(job_id=job_id))

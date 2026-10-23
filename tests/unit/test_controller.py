@@ -711,3 +711,21 @@ async def test_escalation_carries_the_log_excerpts():
     outcome = await make(server).run("j1")
     assert outcome.status == "escalate"
     assert SETTLE in outcome.excerpts["stderr"] and "grompp" not in outcome.excerpts
+
+
+@pytest.mark.anyio
+async def test_progress_events_carry_the_run_status():
+    events: list[dict[str, Any]] = []
+    status = {"state": "running", "time_ps": 12.5, "ns_per_day": 100.0, "eta_s": 30.0}
+    server = FakeServer(statuses={"em": "PASSED", "nvt": "PASSED", "npt": "PASSED",
+                                  "prod": "RUNNING"}, running_polls=1)
+    original = server._get_run_status
+
+    async def with_data(args):
+        result = await original(args)
+        return ok({**result["data"], **(status if result["data"]["state"] == "running" else {})})
+
+    server._get_run_status = with_data
+    await make(server, on_event=events.append).run("j1")
+    progress = [e for e in events if e["state"] == "PROGRESS"]
+    assert progress[0]["stage"] == "prod" and progress[0]["run"]["time_ps"] == 12.5

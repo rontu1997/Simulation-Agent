@@ -275,6 +275,7 @@ class Controller:
                                       counted=False)
             if not status["ok"]:
                 raise _Stop(self._outcome("escalate", stage, _describe(status)))
+            self._emit("PROGRESS", job_id, stage, run=status["data"])
             state = str(status["data"]["state"])
             if state in _ENDED:
                 return state

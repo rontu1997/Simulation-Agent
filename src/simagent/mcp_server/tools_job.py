@@ -122,6 +122,7 @@ def get_job_tool(ctx: ServerContext, args: GetJobArgs) -> dict[str, Any]:
             "matches_plan": bool(approval and approval.get("plan_sha256") == data["plan_sha256"]),
         },
         "retries": data["retries"], "failures": data["failures"],
+        "acknowledged_warnings": [a["id"] for a in data["acknowledged_warnings"]],
         "environment": data["environment"], "execution_mode": data["execution_mode"],
         "job_status": job.job_status(),
         "summary": (json.loads(summary_path.read_text(encoding="utf-8"))
