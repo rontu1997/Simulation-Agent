@@ -151,8 +151,6 @@ def _build(job: JobHandle, runner: RunnerLike, n: int, water_model: str,
         "target_density_g_cm3": density, "build_sha256": build_sha,
         "density_g_cm3": n * MOLAR_MASS_WATER / (AVOGADRO_FACTOR * edge ** 3),
     }
-    (build_dir / "build.json").write_text(json.dumps(info, indent=2, sort_keys=True),
-                                          encoding="utf-8")
     scratch = build_dir / "_dry"
     scratch.mkdir()
     try:
@@ -165,6 +163,9 @@ def _build(job: JobHandle, runner: RunnerLike, n: int, water_model: str,
                                 hint="the topology and coordinates are inconsistent")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+    info["dry_grompp_ok"] = True
+    (build_dir / "build.json").write_text(json.dumps(info, indent=2, sort_keys=True),
+                                          encoding="utf-8")
     files = ["01_build/water_raw.gro", "01_build/water.gro", "01_build/topol.top",
              "01_build/build.json"]
     record_internal(job.ledger, stage="build", tool="build_water_box", base=job.dir,

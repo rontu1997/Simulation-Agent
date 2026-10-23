@@ -145,6 +145,7 @@ def test_build_with_stub_runner(tmp_path):
     expected_density = 1000 * 18.01528 / (602.2140857 * info["box_nm"] ** 3)
     assert info["density_g_cm3"] == pytest.approx(expected_density, rel=1e-9)
     assert info["n_atoms"] == 4000 and info["n_molecules"] == 1000
+    assert info["dry_grompp_ok"] is True
     assert info["build_sha256"] == sha256_text(
         sha256_file(build_dir / "water.gro") + sha256_file(build_dir / "topol.top"))
     assert result["build_sha256"] == info["build_sha256"]
