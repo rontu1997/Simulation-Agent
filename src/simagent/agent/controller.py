@@ -1,0 +1,236 @@
+"""Workflow controller (design 14.2): deterministic sequencing of the approved plan over MCP tools.
+
+The loop is state-driven. Each round reads ``get_job`` and does whatever the first stage that is
+not ``PASSED`` calls for, so a fresh run, a retry, a resume, and a reattach after a restart are
+the same code path. Researcher decisions go through ``Decisions``; this module never calls
+``record_approval`` and never builds a tool argument from log text.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+
+from simagent.agent.diagnostician import Diagnosis, Diagnostician
+from simagent.config import Config
+
+POLL_FLOOR_S = 10.0
+PROCESS_STAGES = ("em", "nvt", "npt", "prod")
+_ENDED = ("finished", "died", "cancelled", "not_started")
+
+
+class ToolCaller(Protocol):
+    async def call(self, name: str, args: dict[str, Any]) -> dict[str, Any]: ...
+
+
+class Decisions(Protocol):
+    async def acknowledge_warnings(self, job_id: str,
+                                   warnings: list[dict[str, Any]]) -> list[str]: ...
+
+    async def on_interrupted(self, job_id: str, stage: str, cause: str,
+                             can_resume: bool) -> str: ...
+
+
+class NoDecisions:
+    """The safe default: acknowledge nothing and stop when a run was interrupted."""
+
+    async def acknowledge_warnings(self, job_id: str, warnings: list[dict[str, Any]]) -> list[str]:
+        return []
+
+    async def on_interrupted(self, job_id: str, stage: str, cause: str, can_resume: bool) -> str:
+        return "stop"
+
+
+@dataclass
+class Outcome:
+    status: str  # done, escalate, cancelled, failed, limit
+    stage: str | None
+    message: str
+    diagnosis: Diagnosis | None = None
+    disclosures: list[str] = field(default_factory=list)
+
+
+class _Stop(Exception):
+    def __init__(self, outcome: Outcome) -> None:
+        super().__init__(outcome.message)
+        self.outcome = outcome
+
+
+def _describe(envelope: dict[str, Any]) -> str:
+    error = envelope.get("error") or {}
+    text = f"{error.get('code', 'E_UNKNOWN')}: {error.get('message', 'the tool failed')}"
+    return f"{text}. {error['hint']}" if error.get("hint") else text
+
+
+class Controller:
+    def __init__(self, tools: ToolCaller, cfg: Config, decisions: Decisions | None = None, *,
+                 sleep: Callable[[float], Awaitable[None]] | None = None,
+                 poll_interval_s: float = POLL_FLOOR_S, max_tool_calls: int = 500,
+                 max_rounds: int = 40, on_event: Callable[[dict[str, Any]], None] | None = None,
+                 diagnostician: Diagnostician | None = None) -> None:
+        self.tools = tools
+        self.cfg = cfg
+        self.decisions: Decisions = decisions if decisions is not None else NoDecisions()
+        self._sleep = sleep
+        self._interval = max(poll_interval_s, POLL_FLOOR_S)
+        self._max_calls = max_tool_calls
+        self._max_rounds = max_rounds
+        self._on_event = on_event
+        self.diagnostician = diagnostician or Diagnostician()
+        self._calls = 0
+        self._cancelled = False
+        self._wake = asyncio.Event()
+        self.disclosures: list[str] = []
+
+    # -- plumbing ---------------------------------------------------------------------------
+
+    def _emit(self, state: str, job_id: str, stage: str | None = None, **extra: Any) -> None:
+        if self._on_event is not None:
+            self._on_event({"state": state, "job_id": job_id, "stage": stage, **extra})
+
+    async def _call(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._calls >= self._max_calls:
+            raise _Stop(Outcome("limit", None, f"stopped after {self._calls} tool calls "
+                                "(the controller's call limit)"))
+        self._calls += 1
+        try:
+            envelope = await self.tools.call(name, args)
+        except Exception as exc:  # the server went away or the transport broke
+            raise _Stop(Outcome("failed", None, f"tool {name} failed: "
+                                f"{type(exc).__name__}: {exc}")) from exc
+        if not isinstance(envelope, dict) or "ok" not in envelope:
+            raise _Stop(Outcome("failed", None, f"tool {name} failed: it returned no result "
+                                "envelope"))
+        return envelope
+
+    async def _wait(self, seconds: float) -> None:
+        if self._sleep is not None:
+            await self._sleep(seconds)
+            return
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=seconds)
+        except TimeoutError:
+            pass
+
+    def _outcome(self, status: str, stage: str | None, message: str,
+                 diagnosis: Diagnosis | None = None) -> Outcome:
+        return Outcome(status, stage, message, diagnosis, list(self.disclosures))
+
+    # -- public -----------------------------------------------------------------------------
+
+    async def run(self, job_id: str) -> Outcome:
+        self._cancelled = False
+        self._wake.clear()
+        self.disclosures = []
+        try:
+            outcome = await self._run(job_id)
+        except _Stop as stop:
+            outcome = stop.outcome
+            outcome.disclosures = list(self.disclosures)
+        state = {"done": "DONE", "escalate": "ESCALATE", "cancelled": "CANCELLED"}.get(
+            outcome.status, "FAILED")
+        self._emit(state, job_id, outcome.stage, message=outcome.message)
+        return outcome
+
+    async def cancel(self, job_id: str) -> dict[str, Any]:
+        """Stop the running stage now: wake the poll sleep, then call ``cancel_run``."""
+        self._cancelled = True
+        self._wake.set()
+        job = await self._call("get_job", {"job_id": job_id})
+        running = next((s for s in PROCESS_STAGES
+                        if job["ok"] and job["data"]["stage_status"].get(s) == "RUNNING"), None)
+        if running is None:
+            return {"ok": True, "data": {"cancelled": False, "signal_sent": None}, "error": None}
+        return await self._call("cancel_run", {"job_id": job_id, "stage": running})
+
+    # -- the loop ---------------------------------------------------------------------------
+
+    async def _run(self, job_id: str) -> Outcome:
+        env = await self._call("gmx_check_environment", {})
+        if not env["ok"]:
+            return self._outcome("failed", None, _describe(env))
+        rounds = 0
+        while True:
+            job = await self._call("get_job", {"job_id": job_id})
+            if not job["ok"]:
+                return self._outcome("failed", None, _describe(job))
+            statuses = job["data"]["stage_status"]
+            stage = next((s for s in PROCESS_STAGES if statuses[s] != "PASSED"), None)
+            if stage is None:
+                return self._outcome("done", "prod", "em, nvt, npt, and prod passed their gates")
+            rounds += 1
+            if rounds > self._max_rounds:
+                return self._outcome("limit", stage, f"stopped after {self._max_rounds} rounds "
+                                     "without finishing")
+            outcome = await self._advance(job_id, stage, job["data"])
+            if outcome is not None:
+                return outcome
+
+    async def _advance(self, job_id: str, stage: str, job: dict[str, Any]) -> Outcome | None:
+        """Do what ``stage`` needs next. ``None`` means progress was made; re-read the job."""
+        status = job["stage_status"][stage]
+        args = {"job_id": job_id, "stage": stage}
+        self._emit("EXECUTE", job_id, stage)
+        if status == "PENDING":
+            stopped = await self._prepare(job_id, stage)
+            if stopped is not None:
+                return stopped
+            status = "READY"
+        if status == "READY":
+            started = await self._call("run_mdrun", {**args, "resume": False})
+            if not started["ok"]:
+                return self._outcome("escalate", stage, _describe(started))
+        elif status != "RUNNING":
+            return self._outcome("escalate", stage, f"{stage} is {status} and needs a decision")
+        await self._poll(job_id, stage)
+        return await self._validate(job_id, stage)
+
+    async def _prepare(self, job_id: str, stage: str) -> Outcome | None:
+        args = {"job_id": job_id, "stage": stage}
+        written = await self._call("write_mdp", args)
+        if not written["ok"]:
+            return self._outcome("escalate", stage, _describe(written))
+        for attempt in range(2):
+            grompp = await self._call("run_grompp", args)
+            if grompp["ok"]:
+                return None
+            warnings = (grompp.get("data") or {}).get("warnings") or []
+            unacknowledged = [w for w in warnings if not w.get("acknowledged")]
+            code = (grompp.get("error") or {}).get("code")
+            if code == "E_GROMPP_FAILED" and unacknowledged and attempt == 0:
+                accepted = await self.decisions.acknowledge_warnings(job_id, unacknowledged)
+                if {w["id"] for w in unacknowledged} <= set(accepted):
+                    continue
+                texts = "; ".join(f"{w['id']}: {w['text']}" for w in unacknowledged)
+                return self._outcome("escalate", stage,
+                                     f"grompp stopped on warnings that were not acknowledged: "
+                                     f"{texts}")
+            return self._outcome("escalate", stage, _describe(grompp))
+        return None  # unreachable: the loop returns or continues
+
+    async def _poll(self, job_id: str, stage: str) -> str:
+        while True:
+            status = await self._call("get_run_status", {"job_id": job_id, "stage": stage})
+            if not status["ok"]:
+                raise _Stop(self._outcome("escalate", stage, _describe(status)))
+            state = str(status["data"]["state"])
+            if state in _ENDED:
+                return state
+            await self._wait(self._interval)
+            if self._cancelled:
+                raise _Stop(self._outcome("cancelled", stage, f"{stage} was cancelled"))
+
+    async def _validate(self, job_id: str, stage: str) -> Outcome | None:
+        result = await self._call("validate_stage", {"job_id": job_id, "stage": stage})
+        if not result["ok"]:
+            code = (result.get("error") or {}).get("code")
+            status = "cancelled" if code == "E_CANCELLED" else "escalate"
+            return self._outcome(status, stage, _describe(result))
+        if result["data"]["passed"]:
+            return None
+        failed = [c["name"] for c in result["data"]["checks"]
+                  if c["status"] in ("fail", "no_receipt", "not_run")]
+        return self._outcome("escalate", stage,
+                             f"{stage} failed its gate: {', '.join(failed) or 'unknown check'}")
