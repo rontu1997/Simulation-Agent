@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Test double for gmx. Produces placeholder files only; it runs no physics.
+
+Used only in simulated mode (SIMAGENT_ALLOW_FAKE=1). Environment knobs for tests:
+  FAKE_GMX_WARNINGS=N      grompp prints N warnings and fails unless -maxwarn >= N
+  FAKE_GMX_MDRUN_SLEEP=S   mdrun sleeps S seconds before finishing
+"""
+import math
+import os
+import sys
+import time
+
+MARKER = "FAKE-GMX OUTPUT\n"
+
+
+def opt(args, name, default=None, count=1):
+    if name in args:
+        i = args.index(name)
+        vals = args[i + 1:i + 1 + count]
+        return vals if count > 1 else (vals[0] if vals else default)
+    return default
+
+
+def write_gro(path, edge):
+    n = round(33.3 * edge ** 3)
+    side = max(1, math.ceil(n ** (1 / 3)))
+    lines = ["fake water", str(4 * n)]
+    atom = 0
+    for mol in range(n):
+        gx, gy, gz = mol % side, (mol // side) % side, mol // (side * side)
+        for name in ("OW", "HW1", "HW2", "MW"):
+            atom += 1
+            x = (gx + 0.5) * edge / side
+            y = (gy + 0.5) * edge / side
+            z = (gz + 0.5) * edge / side
+            lines.append("%5d%-5s%5s%5d%8.3f%8.3f%8.3f" % (mol + 1, "SOL", name, atom % 100000,
+                                                         x, y, z))
+    lines.append("%10.5f%10.5f%10.5f" % (edge, edge, edge))
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def touch(path, text=MARKER):
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def main(argv):
+    if not argv or argv[0] == "--version":
+        print("GROMACS version:    FAKE-0.0")
+        print("GPU support:        disabled")
+        return 0
+    sub, args = argv[0], argv[1:]
+    if sub == "solvate":
+        box = opt(args, "-box", None, 3)
+        write_gro(opt(args, "-o", "out.gro"), float(box[0]) if box else 3.0)
+    elif sub == "editconf":
+        box = opt(args, "-box", None, 3)
+        with open(opt(args, "-f"), encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        if box:
+            lines[-1] = "%10.5f%10.5f%10.5f" % tuple(float(b) for b in box)
+        with open(opt(args, "-o", "out.gro"), "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+    elif sub == "grompp":
+        n = int(os.environ.get("FAKE_GMX_WARNINGS", "0"))
+        allowed = int(opt(args, "-maxwarn", "0"))
+        if n:
+            for i in range(1, n + 1):
+                sys.stderr.write("WARNING %d [file topol.top, line %d]:\n  fake warning %d\n\n"
+                                 % (i, i, i))
+            if n > allowed:
+                word = "was 1 warning" if n == 1 else "were %d warnings" % n
+                sys.stderr.write("There %s\n" % word)
+                return 1
+        touch(opt(args, "-o", "out.tpr"))
+    elif sub == "mdrun":
+        stem = opt(args, "-deffnm", "md")
+        time.sleep(float(os.environ.get("FAKE_GMX_MDRUN_SLEEP", "0")))
+        touch(stem + ".log", MARKER + "Finished mdrun on rank 0\n")
+        for ext in (".edr", ".gro", ".cpt", ".xtc"):
+            touch(stem + ext)
+    elif sub in ("energy", "rdf", "msd", "check"):
+        out = opt(args, "-o")
+        if out:
+            touch(out)
+        print("fake %s done" % sub)
+    else:
+        sys.stderr.write("fake gmx: unknown subcommand %s\n" % sub)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
