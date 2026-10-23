@@ -1,0 +1,35 @@
+# Non-secret defaults. Secrets (LUNA_API_KEY, SIMAGENT_APPROVAL_TOKEN) come from the environment only.
+gmx:
+  bin: /home/rontu/Rontu/software/software_install/gromacs-2025.3/bin/gmx
+  expected_version_prefix: "2025.3"
+  expected_sha256: null
+  ntomp: auto
+  ntmpi: auto
+  cpt_minutes: 15
+  short_cmd_timeout_s: 300
+  max_wall_hours: 24
+  env_passthrough: [PATH, HOME, LANG, LD_LIBRARY_PATH, OMP_NUM_THREADS, OMP_PLACES, OMP_PROC_BIND, KMP_AFFINITY, CUDA_VISIBLE_DEVICES, GMXLIB]
+llm:
+  model: gpt6-luna
+  temperature: 0.1
+  max_tool_calls_per_turn: 25
+  token_budget: 200000
+  request_timeout_s: 120
+workflow:
+  require_approval: true
+  max_auto_retries_per_stage: 2
+  max_production_ns_without_confirm: 10
+paths:
+  runs_dir: ./runs
+  sim_runs_dir: ./runs_simulated
+  memory_dir: ./memory
+gates:
+  em_epot_per_molecule_warn: [-48.0, -34.0]
+  nvt_temp_tol_K: 2.0
+  nvt_temp_drift_fail_K_per_100ps: 1.0
+  nvt_temp_drift_warn_K_per_100ps: 0.5
+  density_warn_g_cm3: [0.96, 1.02]
+  density_fail_g_cm3: [0.90, 1.10]
+  npt_pressure_tol_bar_floor: 50.0
+  prod_temp_tol_K: 1.0
+  conserved_drift_warn_kJ_mol_ps_atom: 0.005
