@@ -198,7 +198,8 @@ class Session:
             await self._say(_failure_text(env))
             return False
         data = env["data"]
-        probe = "ok" if (data.get("probe") or {}).get("ok") else "failed"
+        raw = data.get("probe")  # a dict for a real binary, text such as "skipped (simulated)"
+        probe = raw if isinstance(raw, str) else ("ok" if (raw or {}).get("ok") else "failed")
         await self._say(f"SimAgent. GROMACS {data.get('version', '?')} verified "
                         f"({data.get('execution_mode', '?')} mode, probe run {probe}). "
                         "Describe your simulation.")

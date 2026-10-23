@@ -7,11 +7,11 @@ import pytest
 from test_controller import FakeServer, ok
 from test_controller import err as envelope_error
 
+from scripted import ScriptedConsole, StubLlm, say, submit
 from simagent.agent.controller import Outcome
 from simagent.agent.session import Session, SessionDecisions, final_message
 from simagent.config import load_config
 from simagent.core.provenance import Ledger
-from simagent.llm import ChatReply, ToolCall
 
 TOKEN = "tok-session-0123456789"
 JOB_ID = "water-1000-tip4p-300K-20261023-1"
@@ -21,39 +21,6 @@ PROCESS = ("em", "nvt", "npt", "prod")
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
-
-
-class ScriptedConsole:
-    """Scripted input. An item may be ``(trigger, line)``: the line is released only after the
-    output contains ``trigger``, so scripted answers arrive after their prompt, as a person's
-    would. With ``release_on`` set, an empty script waits (a run is in progress) until that text
-    has been printed, then reports end of input."""
-
-    def __init__(self, inputs, release_on: str | None = None):
-        self.inputs = list(inputs)
-        self.out: list[str] = []
-        self.release_on = release_on
-
-    @property
-    def transcript(self) -> str:
-        return "\n".join(self.out)
-
-    async def say(self, text: str) -> None:
-        self.out.append(text)
-
-    async def ask(self, prompt: str) -> str | None:
-        if prompt:
-            self.out.append(prompt)
-        while True:
-            if self.inputs:
-                item = self.inputs[0]
-                trigger, line = item if isinstance(item, tuple) else (None, item)
-                if trigger is None or trigger in self.transcript:
-                    self.inputs.pop(0)
-                    return line
-            elif not self.release_on or self.release_on in self.transcript:
-                return None
-            await asyncio.sleep(0.005)
 
 
 class SessionServer(FakeServer):
@@ -124,27 +91,6 @@ class SessionServer(FakeServer):
 
     async def _list_artifacts(self, args):
         return ok({"files": [{"path": "02_em/em.tpr", "bytes": 12, "has_receipt": True}]})
-
-
-class StubLlm:
-    def __init__(self, replies):
-        self.replies = list(replies)
-        self.sent: list[list[dict[str, Any]]] = []
-
-    def chat(self, messages, functions=None, max_tokens=1024):
-        self.sent.append(list(messages))
-        item = self.replies[0] if len(self.replies) == 1 else self.replies.pop(0)
-        return item
-
-
-def submit(**fields) -> ChatReply:
-    origins = {k: "user" for k in fields}
-    return ChatReply(content=None, total_tokens=10, tool_calls=[
-        ToolCall("c1", "submit_request", {**fields, "origins": origins})])
-
-
-def say(text: str) -> ChatReply:
-    return ChatReply(content=text, total_tokens=10)
 
 
 def make(server, console, llm=None, **kwargs) -> Session:
@@ -376,3 +322,17 @@ async def test_progress_line_format():
     server.request = request
     await session.execute(JOB_ID)
     assert "[S5 prod] 62% | 620.0 ps | 150 ns/day | ETA 00:00:22" in console.transcript
+
+
+@pytest.mark.anyio
+async def test_start_accepts_the_simulated_probe_text_the_real_server_returns():
+    server = SessionServer()
+
+    async def simulated(args):
+        return ok({"version": "FAKE-0.0", "execution_mode": "simulated",
+                   "probe": "skipped (simulated)"})
+
+    server._gmx_check_environment = simulated
+    console = ScriptedConsole([])
+    assert await make(server, console).start() is True
+    assert "skipped (simulated)" in console.transcript and "simulated mode" in console.transcript

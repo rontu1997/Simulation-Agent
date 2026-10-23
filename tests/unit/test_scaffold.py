@@ -16,7 +16,7 @@ def test_version_is_0_1_0():
 
 
 def test_cli_main_prints_version_and_returns_zero(capsys):
-    assert cli.main([]) == 0
+    assert cli.main(["--version"]) == 0
     assert "simagent 0.1.0" in capsys.readouterr().out
 
 
