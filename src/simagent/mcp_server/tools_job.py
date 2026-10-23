@@ -45,7 +45,8 @@ def _environment(ctx: ServerContext) -> dict[str, Any]:
         return check(ctx.cfg)  # missing binary: let the check raise the precise error
     if key not in cache:
         cache[key] = check(ctx.cfg)
-    return {**cache[key], "host": socket.gethostname()}
+    return {**cache[key], "host": socket.gethostname(),
+            "bin_stat": {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}}
 
 
 @tool("create_job", CreateJobArgs,

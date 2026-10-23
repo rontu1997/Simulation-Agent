@@ -83,3 +83,14 @@ def test_create_job_rejects_out_of_range_request_before_any_work(tmp_path):
     assert exc.value.code == ErrorCode.E_PARAM_OUT_OF_RANGE
     assert calls == []
     assert not (tmp_path / "runs").exists() or not list((tmp_path / "runs").iterdir())
+
+
+def test_environment_records_binary_stat_for_continuity_checks(tmp_path):
+    binary = tmp_path / "gmx"
+    binary.write_bytes(b"\x7fELF1")
+    ctx, _ = make_ctx(tmp_path, binary)
+    out = create_job(ctx, CreateJobArgs(request=REQUEST))
+    stat = binary.stat()
+    assert out["environment"]["bin_stat"] == {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    stored = ctx.extras["store"].get(out["job_id"]).read()["environment"]
+    assert stored["bin_stat"]["size"] == stat.st_size
