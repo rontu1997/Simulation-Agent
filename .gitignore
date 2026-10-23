@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+runs/
+runs_simulated/
+memory/
+.env
+.superpowers/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+*.egg-info/

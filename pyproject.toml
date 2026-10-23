@@ -1,0 +1,31 @@
+[project]
+name = "simagent"
+version = "0.1.0"
+description = "Natural-language molecular simulation agent: plans GROMACS workflows, runs them through MCP tools, and analyzes the results."
+readme = "prd.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2,<3",   # official MCP Python SDK 2.x (server class MCPServer, client ClientSession, stdio transport)
+    "openai",      # OpenAI-compatible client for the gpt6-luna endpoint
+    "pydantic",    # typed tool inputs and outputs
+    "pyyaml",      # config.yaml
+    "jinja2",      # MDP templates
+    "numpy",       # analysis
+    "matplotlib",  # plots
+    "filelock",    # memory file locking
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+    "types-PyYAML",
+]
+
+# No source package exists yet (tracker TASK-010), so uv installs dependencies only.
+# TASK-010 adds a [build-system] table (for example hatchling with a src/ layout) and
+# [project.scripts] entries for `simagent` and `gmx-mcp`, then removes `package = false`.
+[tool.uv]
+package = false
