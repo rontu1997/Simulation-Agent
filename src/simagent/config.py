@@ -9,7 +9,7 @@ import getpass
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -155,6 +155,25 @@ def _threads(raw: str | None, default: int | str) -> int | str:
     return int(raw)
 
 
+def default_config_path(env: Mapping[str, str] | None = None) -> Path | None:
+    """``SIMAGENT_CONFIG`` if set, else ``config.yaml`` in the working directory if it exists."""
+    env = os.environ if env is None else env
+    named = env.get("SIMAGENT_CONFIG")
+    if named:
+        return Path(named)
+    candidate = Path("config.yaml")
+    return candidate if candidate.is_file() else None
+
+
+def _absolute_bin(binary: str) -> str:
+    """A relative binary path is resolved once, so the runner's working directory cannot change
+    what it means."""
+    path = Path(binary)
+    if path.is_absolute() or PurePosixPath(binary).is_absolute():
+        return binary
+    return str(path.resolve())
+
+
 def load_config(env: Mapping[str, str] | None = None, yaml_path: Path | None = None) -> Config:
     env = os.environ if env is None else env
     cfg = Config()
@@ -169,7 +188,8 @@ def load_config(env: Mapping[str, str] | None = None, yaml_path: Path | None = N
     gmx = cfg.gmx
     if "GMX_BIN" in env:
         gmx = replace(gmx, bin=env["GMX_BIN"])
-    gmx = replace(gmx, ntomp=_threads(env.get("GMX_NTOMP"), gmx.ntomp),
+    gmx = replace(gmx, bin=_absolute_bin(gmx.bin),
+                  ntomp=_threads(env.get("GMX_NTOMP"), gmx.ntomp),
                   ntmpi=_threads(env.get("GMX_NTMPI"), gmx.ntmpi))
 
     llm = cfg.llm

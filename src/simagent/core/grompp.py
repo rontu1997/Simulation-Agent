@@ -10,7 +10,7 @@ from typing import Any
 from simagent.config import Config
 from simagent.core.gmx import RunnerLike
 from simagent.core.jobs import PROCESS_STAGES, JobHandle
-from simagent.core.mdp import render_mdp, stage_params
+from simagent.core.mdp import render_mdp, retry_bounds_violation, stage_params
 from simagent.core.paths import sha256_file, sha256_text
 from simagent.core.provenance import record_internal
 from simagent.errors import ErrorCode, SimAgentError
@@ -93,6 +93,9 @@ def check_inputs(job: JobHandle, stage: str, plan: dict[str, Any], request: dict
         if not path.is_file() or not job.ledger.has_receipt(job_rel, sha256_file(path)):
             raise _modified(f"{job_rel} (no matching receipt)")
     data = job.read()
+    for retry in data["retries"]:  # a retry the approved plan does not allow must not run
+        if retry_bounds_violation(plan, retry["key"], retry["value"]) is not None:
+            raise _modified(f"the stored {retry['key']} retry (outside the plan's bounds); it")
     expected = render_mdp(stage, plan, request, data["retries"])
     mdp = job.stage_dir(stage) / f"{stage}.mdp"
     if not mdp.is_file() or mdp.read_text(encoding="utf-8") != expected:

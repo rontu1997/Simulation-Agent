@@ -7,6 +7,8 @@ import json
 import os
 import re
 import socket
+import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
@@ -138,6 +140,35 @@ def list_jobs_tool(ctx: ServerContext, args: ListJobsArgs) -> dict[str, Any]:
     return {"jobs": get_store(ctx).list(limit=args.limit, status=args.status)}
 
 
+_MAX_REGEX_CHARS = 200
+_MAX_LINE_CHARS = 2000
+_REGEX_TIMEOUT_S = 3.0
+_FILTER_CODE = (
+    "import json, re, sys\n"
+    "job = json.load(sys.stdin)\n"
+    "pattern = re.compile(job['pattern'])\n"
+    "json.dump([ln for ln in job['lines'] if pattern.search(ln)], sys.stdout)\n")
+
+
+def _filter_lines(lines: list[str], pattern: str) -> list[str]:
+    """Lines matching ``pattern``. The model supplies the regex, and ``re`` cannot be interrupted,
+    so the match runs in a child process that is killed after a few seconds."""
+    env = {k: v for k, v in os.environ.items() if k in ("SYSTEMROOT", "PATH")}
+    payload = json.dumps({"pattern": pattern, "lines": [ln[:_MAX_LINE_CHARS] for ln in lines]})
+    try:
+        done = subprocess.run(  # noqa: S603 - fixed argument list, shell=False
+            [sys.executable, "-I", "-c", _FILTER_CODE], input=payload, capture_output=True,
+            text=True, timeout=_REGEX_TIMEOUT_S, env=env, shell=False, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise SimAgentError(ErrorCode.E_PARAM_OUT_OF_RANGE, "the regex took too long to match",
+                            hint="use a simpler pattern without nested repetition") from exc
+    if done.returncode != 0:
+        raise SimAgentError(ErrorCode.E_PARAM_OUT_OF_RANGE, "the regex could not be applied",
+                            hint="use a simpler regular expression")
+    matched: list[str] = json.loads(done.stdout)
+    return matched
+
+
 class LogExcerptArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     job_id: str
@@ -158,10 +189,13 @@ def get_log_excerpt(ctx: ServerContext, args: LogExcerptArgs) -> dict[str, Any]:
         raise SimAgentError(ErrorCode.E_PARAM_OUT_OF_RANGE,
                             f"lines = {args.lines} is outside 1 to 40",
                             hint="ask for at most 40 lines")
-    pattern = None
     if args.regex is not None:
+        if len(args.regex) > _MAX_REGEX_CHARS:
+            raise SimAgentError(ErrorCode.E_PARAM_OUT_OF_RANGE,
+                                f"the regex is longer than {_MAX_REGEX_CHARS} characters",
+                                hint="use a shorter pattern")
         try:
-            pattern = re.compile(args.regex)
+            re.compile(args.regex)
         except re.error as exc:
             raise SimAgentError(ErrorCode.E_PARAM_OUT_OF_RANGE, f"invalid regex: {exc}",
                                 hint="use a valid regular expression") from exc
@@ -172,9 +206,10 @@ def get_log_excerpt(ctx: ServerContext, args: LogExcerptArgs) -> dict[str, Any]:
         raise SimAgentError(ErrorCode.E_ANALYSIS_INPUT, f"no {args.which} file for {args.stage}",
                             hint="the stage has not produced that file yet")
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    if pattern is not None:
-        lines = [ln for ln in lines if pattern.search(ln)]
-    return {"lines": lines[-args.lines:], "path": f"{STAGE_DIRS[args.stage]}/{name}"}
+    if args.regex is not None:
+        lines = _filter_lines(lines, args.regex)
+    return {"lines": [ln[:_MAX_LINE_CHARS] for ln in lines[-args.lines:]],
+            "path": f"{STAGE_DIRS[args.stage]}/{name}"}
 
 
 class ArtifactsArgs(BaseModel):

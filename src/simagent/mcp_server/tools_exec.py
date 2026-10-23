@@ -228,11 +228,13 @@ def run_mdrun_tool(ctx: ServerContext, args: MdrunArgs) -> dict[str, Any]:
         pid = launcher(stage_dir, argv, build_gmx_env(ctx.cfg.gmx, os.environ),
                        ledger_path=job.dir / "provenance.jsonl", stage=stage,
                        max_wall_hours=ctx.cfg.gmx.max_wall_hours)
-    except OSError as exc:
+    except Exception as exc:  # whatever went wrong, the stage must not stay RUNNING
         job.update(lambda d: d["stage_status"].__setitem__(stage, previous))
         (stage_dir / "run.json").unlink(missing_ok=True)
-        raise SimAgentError(ErrorCode.E_MDRUN_FAILED, f"could not start the mdrun wrapper: {exc}",
-                            hint="check that the server can start processes") from exc
+        raise SimAgentError(
+            ErrorCode.E_MDRUN_FAILED,
+            f"could not start the mdrun wrapper: {type(exc).__name__}: {exc}",
+            hint="check that the server can start processes") from exc
     return {"pid": pid, "started_at": datetime.now(UTC).isoformat(),
             "log_path": f"{STAGE_DIRS[stage]}/{stage}.log"}
 
@@ -328,6 +330,9 @@ def cancel_run_tool(ctx: ServerContext, args: CancelArgs) -> dict[str, Any]:
     if job.status(stage) != "RUNNING":
         return {"cancelled": False, "signal_sent": None}
     state, files = _process_state(ctx, job, stage)
+    if state == "cancelled":  # an earlier cancel was interrupted before the stage was settled
+        job.set_status(stage, "CANCELLED")
+        return {"cancelled": True, "signal_sent": None}
     if state != "running" or files.run_json is None:
         return {"cancelled": False, "signal_sent": None}
     stage_dir = job.stage_dir(stage)

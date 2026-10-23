@@ -106,6 +106,8 @@ class LlmClient:
              max_tokens: int = 1024) -> ChatReply:
         if not self.cfg.api_key:
             raise self._fail("LUNA_API_KEY is not set")
+        if not self.cfg.base_url:  # never fall back to the SDK's default (a third-party host)
+            raise self._fail("LUNA_BASE_URL is not set")
         waits = list(BACKOFF_SECONDS)
         while True:
             use_json = self._json_mode and bool(functions)

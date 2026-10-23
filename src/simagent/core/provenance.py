@@ -22,18 +22,21 @@ class Ledger:
         self._lock = FileLock(str(self.path) + ".lock")
 
     def _last_seq(self) -> int:
+        records = self.records()
+        return records[-1]["seq"] if records else 0
+
+    def _drop_torn_tail(self) -> None:
+        """Cut an unterminated last line (a write that a crash or a full disk interrupted)."""
         if not self.path.exists():
-            return 0
-        last = 0
-        with open(self.path, encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
-                    last = json.loads(line)["seq"]
-        return last
+            return
+        data = self.path.read_bytes()
+        if data and not data.endswith(b"\n"):
+            with open(self.path, "r+b") as handle:
+                handle.truncate(data.rfind(b"\n") + 1)
 
     def append(self, record: dict[str, Any]) -> int:
         with self._lock:
+            self._drop_torn_tail()
             seq = self._last_seq() + 1
             full = {**record, "seq": seq, "ts": datetime.now(UTC).isoformat()}
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -44,8 +47,14 @@ class Ledger:
     def records(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
-        with open(self.path, encoding="utf-8") as handle:
-            return [json.loads(line) for line in handle if line.strip()]
+        records: list[dict[str, Any]] = []
+        with open(self.path, encoding="utf-8", newline="") as handle:
+            for line in handle:
+                if not line.endswith("\n"):
+                    break  # a torn final line is not a record
+                if line.strip():
+                    records.append(json.loads(line))
+        return records
 
     def has_receipt(self, rel_path: str, sha256: str) -> bool:
         for record in self.records():

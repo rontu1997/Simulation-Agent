@@ -98,10 +98,12 @@ def set_plan(job: JobHandle, cfg: Config, request: dict[str, Any],
 
     digest = plan_sha256(request, plan)
     invalidated: list[str] = []
+    changed: set[str] = set()
     old_plan = data["plan"]
     if old_plan is not None:
-        first = next((n for n in _COMPARED_STAGES
-                      if stage_params(old_plan, n) != stage_params(plan, n)), None)
+        changed = {n for n in _COMPARED_STAGES
+                   if stage_params(old_plan, n) != stage_params(plan, n)}
+        first = next((n for n in _COMPARED_STAGES if n in changed), None)
         if first is not None:
             invalidated = job.invalidate(first)
 
@@ -112,6 +114,11 @@ def set_plan(job: JobHandle, cfg: Config, request: dict[str, Any],
         d["approval"] = None
         d["acknowledged_warnings"] = []
         d["pending_warnings"] = []
+        # design 4.3 item 7: a stage whose params changed starts again without old failures or
+        # retries, so the approved plan alone decides what runs
+        d["failures"] = [f for f in d["failures"] if f["stage"] not in changed]
+        d["retries"] = [r for r in d["retries"]
+                        if r["stage"] not in changed and r["failing_stage"] not in changed]
 
     job.update(store)
     return {"plan_sha256": digest, "invalidated": invalidated}

@@ -26,7 +26,7 @@ Priority: P0 must for v1, P1 should, P2 could. Dependencies list task numbers (`
 |---|---|---|
 | M0 Documents | In progress | Six documents written; round 8 scored and corrected (v1.8); round 9 pending (section 7.3) |
 | M1 Foundation | Done on the authoring host | TASK-010 to 016 and 018 done; TASK-017 CI file written, first CI run pending; TASK-013 and TASK-014 live checks pending (real binary, live endpoint) |
-| M2 MCP server | Done on the authoring host | TASK-019 to 028, 035, 050, 060, 068 done. Suite on Windows: 312 passed, 8 skipped; on Linux (WSL Ubuntu): 316 passed, 4 skipped. Pending on the Linux host with GROMACS: `test_real_flow_em` (T-INT-01 slice), `test_build_real`, `test_envcheck_real`; the nvt, npt, prod gates are untested against a real run |
+| M2 MCP server | Done on the authoring host | TASK-019 to 028, 035, 050, 060, 068 done. Suite on Windows: 326 passed, 8 skipped; on Linux (WSL Ubuntu): 330 passed, 4 skipped. Pending on the Linux host with GROMACS: `test_real_flow_em` (T-INT-01 slice), `test_build_real`, `test_envcheck_real`; the nvt, npt, prod gates are untested against a real run |
 | M3 Workflow engine | Not started | |
 | M4 Agent | Not started | |
 | M5 Analysis and report | Not started | |

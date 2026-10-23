@@ -247,8 +247,12 @@ def apply_validation(job: JobHandle, stage: str, *, process_state: str | None,
     if status in ("PENDING", "READY"):
         return report([GateCheck("stage_ran", "not_run", value=status)], False)
     if stage in PROCESS_STAGES and status == "RUNNING":
-        if process_state in ("died", "timeout"):
-            name = "process_died" if process_state == "died" else "timeout"
+        if process_state == "cancelled":  # a cancel interrupted before the stage was settled
+            job.set_status(stage, "CANCELLED")
+            raise SimAgentError(ErrorCode.E_CANCELLED, f"{stage} was cancelled",
+                                hint="reset the stage and run it again")
+        if process_state in ("died", "timeout", "not_started"):
+            name = "timeout" if process_state == "timeout" else "process_died"
             job.set_status(stage, "FAILED")
             record_failure(name)
             return report([GateCheck(name, "fail", value=process_state)], False)
@@ -258,7 +262,10 @@ def apply_validation(job: JobHandle, stage: str, *, process_state: str | None,
         status = "GATING"
     elif status == "RUNNING":  # build or analysis still in progress
         return report([GateCheck("stage_running", "not_run")], False)
-    checks = gate_fn()
+    try:
+        checks = gate_fn()
+    except SimAgentError as exc:  # unreadable inputs fail the gate; they must not strand the stage
+        checks = [GateCheck("gate_input", "fail", value=exc.message)]
     passed = gate_result(checks)
     if status == "GATING":
         job.set_status(stage, "PASSED" if passed else "FAILED")

@@ -7,6 +7,7 @@ tool envelope (design 4) instead of as plain-text SDK errors, and returns a ``Ca
 
 from __future__ import annotations
 
+import errno
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -16,7 +17,7 @@ import anyio.to_thread
 from mcp import types
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from simagent.config import Config, load_config
+from simagent.config import Config, default_config_path, load_config
 from simagent.core.paths import validate_job_id
 from simagent.errors import ErrorCode, SimAgentError, error_envelope, fail, ok
 from simagent.events import EventLog, Redactor, timed_tool
@@ -34,7 +35,7 @@ class ServerContext:
 
     @classmethod
     def create(cls, cfg: Config | None = None) -> ServerContext:
-        cfg = cfg or load_config()
+        cfg = cfg or load_config(yaml_path=default_config_path())
         redactor = Redactor([cfg.llm.api_key or "", cfg.approval_token or ""])
         events = EventLog(cfg.paths.runs_dir / "_server" / "events.jsonl", redactor)
         return cls(cfg=cfg, events=events)
@@ -97,8 +98,17 @@ async def dispatch(ctx: ServerContext, name: str,
         return _result(ok(data))
     except SimAgentError as exc:
         return _result(error_envelope(exc))
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            return _result(fail(ErrorCode.E_DISK_FULL, "no space left on device",
+                                hint="free disk space and run the step again"))
+        return _unexpected(ctx, name, exc)
     except Exception as exc:  # unexpected server bug: report the type only, log the details
-        ctx.events.emit("error", "server", "unexpected_exception", data={
-            "tool": name, "type": type(exc).__name__, "detail": str(exc)})
-        return _result(fail(ErrorCode.E_INTERNAL, f"unexpected {type(exc).__name__} in {name}",
-                            hint="see the server event log; this is a bug"))
+        return _unexpected(ctx, name, exc)
+
+
+def _unexpected(ctx: ServerContext, name: str, exc: Exception) -> types.CallToolResult:
+    ctx.events.emit("error", "server", "unexpected_exception", data={
+        "tool": name, "type": type(exc).__name__, "detail": str(exc)})
+    return _result(fail(ErrorCode.E_INTERNAL, f"unexpected {type(exc).__name__} in {name}",
+                        hint="see the server event log; this is a bug"))

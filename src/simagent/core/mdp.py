@@ -256,24 +256,32 @@ def render_mdp(stage: str, plan: dict[str, Any], request: dict[str, Any],
     return _ENV.get_template(f"{stage}.mdp.j2").render(**context)
 
 
+def retry_bounds_violation(plan: dict[str, Any], key: str, value: float) -> tuple[str, str] | None:
+    """Message and hint when a retry is outside the plan's ``automatic_retries_allowed``."""
+    entry = next((e for e in plan.get("automatic_retries_allowed", []) if e.get("key") == key),
+                 None)
+    if entry is None:
+        return (f"{key} is not an allowed automatic retry",
+                "only the retries listed in the approved plan are allowed")
+    if "allowed" in entry and value not in entry["allowed"]:
+        return (f"{key}={value} is not in the allowed values {entry['allowed']}",
+                "use a value from the approved plan")
+    if ("min" in entry and value < entry["min"]) or ("max" in entry and value > entry["max"]):
+        return (f"{key}={value} is outside the approved bounds",
+                "a retry may only make the stage more conservative")
+    return None
+
+
 def check_retry(plan: dict[str, Any], state: dict[str, Any], key: str, value: float,
                 failing_stage: str | None, target_stage: str | None = None) -> str:
     """Validate a retry against the plan's bounds and the recorded failures.
 
     Returns the failing stage the retry is attributed to.
     """
-    entry = next((e for e in plan.get("automatic_retries_allowed", []) if e.get("key") == key),
-                 None)
+    violation = retry_bounds_violation(plan, key, value)
+    if violation is not None:
+        raise SimAgentError(ErrorCode.E_RETRY_NOT_ALLOWED, violation[0], hint=violation[1])
     not_allowed = ErrorCode.E_RETRY_NOT_ALLOWED
-    if entry is None:
-        raise SimAgentError(not_allowed, f"{key} is not an allowed automatic retry",
-                            hint="only the retries listed in the approved plan are allowed")
-    if "allowed" in entry and value not in entry["allowed"]:
-        raise SimAgentError(not_allowed, f"{key}={value} is not in the allowed values "
-                            f"{entry['allowed']}", hint="use a value from the approved plan")
-    if ("min" in entry and value < entry["min"]) or ("max" in entry and value > entry["max"]):
-        raise SimAgentError(not_allowed, f"{key}={value} is outside the approved bounds",
-                            hint="a retry may only make the stage more conservative")
     failures = state.get("failures", [])
     if not failures:
         raise SimAgentError(not_allowed, "no failure is recorded",
