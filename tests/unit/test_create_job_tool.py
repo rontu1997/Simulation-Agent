@@ -64,3 +64,22 @@ def test_simulated_environment_creates_job_under_sim_dir(tmp_path):
         "probe": "skipped (simulated)"}
     out = create_job(ctx, CreateJobArgs(request=REQUEST))
     assert Path(out["job_dir"]).parent.name == "runs_simulated"
+
+
+def test_create_job_rejects_out_of_range_request_before_any_work(tmp_path):
+    import copy
+
+    import pytest
+
+    from simagent.errors import ErrorCode, SimAgentError
+
+    binary = tmp_path / "gmx"
+    binary.write_bytes(b"\x7fELF1")
+    ctx, calls = make_ctx(tmp_path, binary)
+    bad = copy.deepcopy(REQUEST)
+    bad["thermo"]["temperature_K"] = 199
+    with pytest.raises(SimAgentError) as exc:
+        create_job(ctx, CreateJobArgs(request=bad))
+    assert exc.value.code == ErrorCode.E_PARAM_OUT_OF_RANGE
+    assert calls == []
+    assert not (tmp_path / "runs").exists() or not list((tmp_path / "runs").iterdir())

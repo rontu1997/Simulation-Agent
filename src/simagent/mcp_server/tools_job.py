@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict
 from simagent.core.envcheck import check_environment
 from simagent.core.gmx import build_gmx_env
 from simagent.core.jobs import JobStore
+from simagent.core.mdp import validate_request
 from simagent.core.paths import sha256_file
 from simagent.mcp_server.registry import ServerContext, tool
 
@@ -50,6 +51,8 @@ def _environment(ctx: ServerContext) -> dict[str, Any]:
 @tool("create_job", CreateJobArgs,
       "Create a job directory for a simulation request and record the verified environment.")
 def create_job(ctx: ServerContext, args: CreateJobArgs) -> dict[str, Any]:
+    warnings = validate_request(args.request)
     environment = _environment(ctx)
     job = get_store(ctx).create(args.request, environment["execution_mode"], environment)
-    return {"job_id": job.job_id, "job_dir": str(job.dir), "environment": environment}
+    return {"job_id": job.job_id, "job_dir": str(job.dir), "environment": environment,
+            "warnings": warnings}

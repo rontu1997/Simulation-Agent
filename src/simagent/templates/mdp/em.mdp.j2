@@ -1,0 +1,16 @@
+integrator            = steep
+emtol                 = {{ emtol }}
+emstep                = 0.01
+nsteps                = {{ em_nsteps }}
+cutoff-scheme         = Verlet
+pbc                   = xyz
+coulombtype           = PME
+rcoulomb              = 1.0
+pme-order             = 4
+fourierspacing        = 0.12
+vdwtype               = cut-off
+rvdw                  = 1.0
+DispCorr              = EnerPres
+nstenergy             = 10
+nstlog                = 10
+nstxout-compressed    = 0
