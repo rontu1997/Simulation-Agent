@@ -4,13 +4,42 @@
 Used only in simulated mode (SIMAGENT_ALLOW_FAKE=1). Environment knobs for tests:
   FAKE_GMX_WARNINGS=N      grompp prints N warnings and fails unless -maxwarn >= N
   FAKE_GMX_MDRUN_SLEEP=S   mdrun sleeps S seconds before finishing
+  FAKE_GMX_FAIL_ONCE=STAGE:KIND  the first mdrun of STAGE fails (KIND settle writes the SETTLE
+                           error text to stderr), later runs succeed
+  FAKE_GMX_SLEEP_ONCE=STAGE:S    the first mdrun of STAGE sleeps S seconds, later runs do not
+Knobs come from the environment, or from knobs.json next to this script (the server hands gmx an
+allow-listed environment, so integration tests use the file).
 """
+import json
 import math
 import os
 import sys
 import time
 
 MARKER = "FAKE-GMX OUTPUT\n"
+KNOB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knobs.json")
+FAIL_TEXT = {"settle": "Water molecule starting at atom 17 can not be settled.\n"}
+
+
+def knob(name, default=""):
+    if name in os.environ:
+        return os.environ[name]
+    try:
+        with open(KNOB_FILE, encoding="utf-8") as handle:
+            return str(json.load(handle).get(name, default))
+    except (OSError, ValueError):
+        return default
+
+
+def once(name, stem):
+    """The text after STAGE: when the knob names this stage and has not fired yet."""
+    stage, _, value = knob(name).partition(":")
+    marker = os.path.join("..", ".fake_%s_%s" % (name.lower(), stem))
+    if stage != stem or os.path.exists(marker):
+        return None
+    with open(marker, "w", encoding="utf-8") as handle:
+        handle.write("fired\n")
+    return value
 
 
 def opt(args, name, default=None, count=1):
@@ -63,7 +92,7 @@ def main(argv):
         with open(opt(args, "-o", "out.gro"), "w", encoding="utf-8") as handle:
             handle.write("\n".join(lines) + "\n")
     elif sub == "grompp":
-        n = int(os.environ.get("FAKE_GMX_WARNINGS", "0"))
+        n = int(knob("FAKE_GMX_WARNINGS", "0"))
         allowed = int(opt(args, "-maxwarn", "0"))
         if n:
             for i in range(1, n + 1):
@@ -76,7 +105,13 @@ def main(argv):
         touch(opt(args, "-o", "out.tpr"))
     elif sub == "mdrun":
         stem = opt(args, "-deffnm", "md")
-        time.sleep(float(os.environ.get("FAKE_GMX_MDRUN_SLEEP", "0")))
+        touch(stem + ".cpt")  # a checkpoint exists from the start, as after the first cpt interval
+        failure = once("FAKE_GMX_FAIL_ONCE", stem)
+        if failure is not None:
+            sys.stderr.write(FAIL_TEXT.get(failure, "fake mdrun failure\n"))
+            return 1
+        pause = once("FAKE_GMX_SLEEP_ONCE", stem)
+        time.sleep(float(pause or 0) + float(knob("FAKE_GMX_MDRUN_SLEEP", "0")))
         touch(stem + ".log", MARKER + "Finished mdrun on rank 0\n")
         for ext in (".edr", ".gro", ".cpt", ".xtc"):
             touch(stem + ext)

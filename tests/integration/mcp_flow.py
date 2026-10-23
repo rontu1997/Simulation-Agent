@@ -97,8 +97,9 @@ async def wait_for_state(session: McpSession, job_id: str, stage: str, want: str
         await asyncio.sleep(0.5)
 
 
-async def run_em_flow(session: McpSession) -> dict[str, Any]:
-    """create_job to a validated EM stage; returns the envelopes the tests assert on."""
+async def prepare_approved_job(session: McpSession) -> dict[str, Any]:
+    """create_job, build, set_plan, and plan approval (the test plays the CLI and holds the
+    token). Returns the created job and the build."""
     created = await session.call("create_job", {"request": dict(REQUEST)})
     assert created["ok"], created
     job_id = created["data"]["job_id"]
@@ -113,6 +114,13 @@ async def run_em_flow(session: McpSession) -> dict[str, Any]:
         "job_id": job_id, "approval_token": TOKEN, "kind": "plan",
         "plan_sha256": planned["data"]["plan_sha256"]})
     assert approved["ok"], approved
+    return {"created": created["data"], "built": built["data"], "job_id": job_id}
+
+
+async def run_em_flow(session: McpSession) -> dict[str, Any]:
+    """create_job to a validated EM stage; returns the envelopes the tests assert on."""
+    prepared = await prepare_approved_job(session)
+    job_id = prepared["job_id"]
     for step in ("write_mdp", "run_grompp"):
         done = await session.call(step, {"job_id": job_id, "stage": "em"})
         assert done["ok"], done
@@ -120,5 +128,5 @@ async def run_em_flow(session: McpSession) -> dict[str, Any]:
     assert started["ok"], started
     final = await wait_for_state(session, job_id, "em", "finished")
     validated = await session.call("validate_stage", {"job_id": job_id, "stage": "em"})
-    return {"created": created["data"], "built": built["data"], "started": started["data"],
-            "final": final, "validated": validated}
+    return {"created": prepared["created"], "built": prepared["built"],
+            "started": started["data"], "final": final, "validated": validated}
