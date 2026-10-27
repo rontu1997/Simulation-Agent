@@ -30,6 +30,7 @@ def _mask(value: str | None) -> str:
 @dataclass(frozen=True)
 class GmxConfig:
     bin: str = GMX_DEFAULT_BIN
+    library_dir: str | None = None
     expected_version_prefix: str = "2025.3"
     expected_sha256: str | None = None
     ntomp: int | str = "auto"

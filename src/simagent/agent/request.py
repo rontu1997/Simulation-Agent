@@ -6,6 +6,7 @@ module decides what is still missing, what to ask, and what a finished request l
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -78,6 +79,71 @@ def parse_value(name: str, text: str) -> Any:
     except ValueError as exc:
         raise ValueError(f"{name} must be a number") from exc
     return _coerce(name, number)
+
+
+def explicit_clarification_answers(text: str, questions: Sequence[Question]) -> dict[str, Any]:
+    """Keep unambiguous answers even when the model does not submit them."""
+    asked = {question.field for question in questions}
+    values: dict[str, Any] = {}
+    clauses = [part.strip().lower() for part in re.split(r"[;,]|(?<!\d)\.|\.(?!\d)", text)]
+    if "water_model" in asked:
+        for clause in clauses:
+            match = re.fullmatch(r"(?:water[_\s]*model\s*[:=]\s*)?(tip4p|tip4pew)", clause)
+            if match:
+                values["water_model"] = match.group(1)
+                break
+        if "water_model" not in values:
+            match = re.search(r"\b(?:filled with|use|using)\s+(tip4p|tip4pew)\s+water\b",
+                              text, re.IGNORECASE)
+            if match:
+                values["water_model"] = match.group(1).lower()
+    if "force_field" in asked:
+        for clause in clauses:
+            match = re.fullmatch(r"(?:force\s*field\s*[:=]\s*)?(oplsaa)", clause)
+            if match:
+                values["force_field"] = match.group(1)
+                break
+        if "force_field" not in values:
+            match = re.search(r"\b(?:use|using)\s+(oplsaa)\s+force\s*field\b",
+                              text, re.IGNORECASE)
+            if match:
+                values["force_field"] = match.group(1).lower()
+    if "n_molecules" in asked:
+        count = re.fullmatch(r"\s*(\d+)(?:\s+(?:water\s+)?molecules?)?\s*", text,
+                             re.IGNORECASE)
+        if count is None:
+            count = re.search(r"\b(?:n_molecules|molecule\s+count|molecules)\s*[:=]\s*"
+                              r"(\d+)\b", text, re.IGNORECASE)
+        if count is None and questions[0].field == "n_molecules":
+            count = re.fullmatch(r"(\d+)(?:\s+(?:water\s+)?molecules?)?", clauses[0],
+                                 re.IGNORECASE)
+        if count is not None:
+            values["n_molecules"] = int(count.group(1))
+    number = r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))"
+    numeric = (
+        ("temperature_K", rf"(?<![\w.]){number}\s*(?:K|kelvin)\b",
+         rf"\btemperature(?:_K)?\s*[:=]\s*{number}\b"),
+        ("pressure_bar", rf"(?<![\w.]){number}\s*bar\b",
+         rf"\bpressure(?:_bar)?\s*[:=]\s*{number}\b"),
+        ("prod_ns", rf"(?<![\w.]){number}\s*ns\b",
+         rf"\b(?:prod_ns|production(?:\s+run)?(?:\s+length)?)\s*[:=]\s*{number}\b"),
+    )
+    for field_name, with_unit, with_label in numeric:
+        if field_name not in asked:
+            continue
+        match = re.search(with_unit, text, re.IGNORECASE) or re.search(
+            with_label, text, re.IGNORECASE)
+        if match:
+            values[field_name] = float(match.group(1))
+    if not values and questions:
+        bare = re.fullmatch(rf"\s*{number}\s*", text)
+        first = questions[0].field
+        if bare and first in ("n_molecules", "temperature_K", "pressure_bar", "prod_ns"):
+            try:
+                values[first] = parse_value(first, bare.group(1))
+            except ValueError:
+                pass
+    return {**values, "origins": {name: "user" for name in values}} if values else {}
 
 
 def merge_submission(draft: RequestDraft, submitted: dict[str, Any]) -> RequestDraft:

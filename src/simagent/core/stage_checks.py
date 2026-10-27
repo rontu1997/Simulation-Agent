@@ -77,12 +77,24 @@ def _series(job: JobHandle, runner: RunnerLike, stage: str,
     if result.exit_code != 0 or not path.is_file():
         raise SimAgentError(ErrorCode.E_ANALYSIS_INPUT, f"cannot read {term} from {stage}.edr",
                             hint="the stage did not write a usable energy file")
-    _, rows = parse_xvg(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    _, rows = parse_xvg(text)
     rows = [r for r in rows if len(r) >= 2]
     if not rows:
         raise SimAgentError(ErrorCode.E_ANALYSIS_INPUT, f"{term} has no data in {stage}.edr",
                             hint="the stage wrote no energy frames")
-    return [r[0] for r in rows], [r[1] for r in rows]
+    values = [r[1] for r in rows]
+    if term == "Density":
+        label = re.search(r'@\s*yaxis\s+label\s+"\(([^"\n]+)\)"', text)
+        unit = label.group(1).strip() if label else None
+        if unit == "kg/m^3":
+            values = [value / 1000 for value in values]
+        elif unit != "g/cm^3":
+            raise SimAgentError(ErrorCode.E_ANALYSIS_INPUT,
+                                f"unrecognized Density unit in {name}: {unit or 'missing'}",
+                                hint="check the GROMACS energy output before applying "
+                                     "density gates")
+    return [r[0] for r in rows], values
 
 
 def _trajectory(job: JobHandle, runner: RunnerLike, stage: str) -> tuple[int, float]:

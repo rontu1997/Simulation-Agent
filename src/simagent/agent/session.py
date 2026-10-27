@@ -31,6 +31,7 @@ from simagent.agent.request import (
     Question,
     RequestDraft,
     accept,
+    explicit_clarification_answers,
     finalize,
     merge_submission,
     missing_questions,
@@ -39,7 +40,7 @@ from simagent.agent.request import (
 from simagent.config import Config
 from simagent.core.provenance import Ledger
 
-MAX_CLARIFY_ROUNDS = 4
+MAX_STALLED_CLARIFY_ROUNDS = 4
 STAGE_IDS = {"em": "S2", "nvt": "S3", "npt": "S4", "prod": "S5"}
 STAGE_ORDER = ("build", "em", "nvt", "npt", "prod", "analysis")
 YES = {"y", "yes"}
@@ -235,8 +236,13 @@ class Session:
             await self._say("No model is configured: set LUNA_API_KEY and LUNA_BASE_URL, or "
                             "use `simagent run --request-file`.")
             return
+        initial = explicit_clarification_answers(
+            text, missing_questions(self.draft, limit=len(SCIENCE_CRITICAL)))
+        if initial:
+            self.draft = merge_submission(self.draft, initial)
         message: str | None = text
-        rounds = 0
+        stalled_rounds = 0
+        rejected_submissions = 0
         while True:
             extra: list[Question] = []
             if message is not None:
@@ -250,19 +256,22 @@ class Session:
                 extra = turn.questions
                 if turn.submission:
                     try:
+                        previous = self.draft
                         self.draft = merge_submission(self.draft, turn.submission)
                     except ValueError as exc:
                         message = f"submit_request was rejected: {exc}. Submit it again."
-                        rounds += 1
-                        if rounds > MAX_CLARIFY_ROUNDS:
+                        rejected_submissions += 1
+                        if rejected_submissions > MAX_STALLED_CLARIFY_ROUNDS:
                             await self._say("I could not understand the request fields.")
                             return
                         continue
+                    rejected_submissions = 0
+                    if self.draft != previous:
+                        stalled_rounds = 0
             questions = self._questions(extra)
             if not questions:
                 break
-            rounds += 1
-            if rounds > MAX_CLARIFY_ROUNDS:
+            if stalled_rounds >= MAX_STALLED_CLARIFY_ROUNDS:
                 await self._say("I could not complete the request after several rounds of "
                                 "questions. Please restate it with the missing values, or use "
                                 "`simagent run --request-file`.")
@@ -270,13 +279,24 @@ class Session:
             reply = await self._ask_questions(questions)
             if reply is None:
                 return
+            previous = self.draft
             tokens = reply.lower().split()
             if tokens and all(t in YES for t in tokens) and len(tokens) in (1, len(questions)):
                 self.draft = accept(self.draft, questions)
             elif reply.strip():
+                explicit = explicit_clarification_answers(reply, questions)
+                if explicit:
+                    self.draft = merge_submission(self.draft, explicit)
+                if ("n_molecules" in {q.field for q in questions}
+                        and "n_molecules" not in self.draft.values
+                        and "maximum" in reply.lower()):
+                    await self._say("I need a whole-number molecule count. SimAgent chooses the "
+                                    "cubic box edge from that count, so it cannot enforce an "
+                                    "exact box size.")
                 message = reply
             else:
                 await self._say("I need an answer to continue (yes accepts my proposals).")
+            stalled_rounds = 0 if self.draft != previous else stalled_rounds + 1
         request = finalize(self.draft)
         self.draft = RequestDraft()
         await self._plan_and_run(request)

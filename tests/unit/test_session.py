@@ -104,7 +104,7 @@ def make(server, console, llm=None, **kwargs) -> Session:
 FULL_SCRIPT = [
     "run 1000 tip4p waters for 1 ns",
     ("Details I need", "yes yes yes"),
-    ("production run", "yes yes"),
+    ("Details I need", "yes"),
 ]
 
 
@@ -164,6 +164,62 @@ async def test_clarification_is_bounded(tmp_path, answers):
         server, ["run waters", *answers], llm, release=None)
     assert "create_job" not in server.names()
     assert "could not" in console.transcript.lower()
+
+
+@pytest.mark.anyio
+async def test_explicit_clarification_answers_are_kept_when_model_does_not_submit(tmp_path):
+    server = SessionServer(tmp_path)
+    llm = StubLlm([say("")])
+    session, console = await finish_conversation(server, [
+        "create a 3.5 nm box of water",
+        ("Details I need", "Maximum number possible. TIP4P. forcefield: oplsaa"),
+        ("Details I need", "1429"),
+    ], llm, release=None)
+
+    assert session.draft.values["water_model"] == "tip4p"
+    assert session.draft.values["force_field"] == "oplsaa"
+    assert session.draft.origins["water_model"] == "user"
+    assert session.draft.origins["force_field"] == "user"
+    assert session.draft.values["n_molecules"] == 1429
+    assert session.draft.origins["n_molecules"] == "user"
+    assert console.transcript.count("Which water model?") == 1
+    assert console.transcript.count("Which force field?") == 1
+    assert console.transcript.count("How many water molecules") == 2
+    assert "whole-number molecule count" in console.transcript
+
+
+@pytest.mark.anyio
+async def test_one_value_per_line_can_finish_clarification_without_round_limit(tmp_path):
+    server = SessionServer(tmp_path)
+    llm = StubLlm([say("")])
+    _, console = await finish_conversation(server, [
+        "create a 3.5 nm box filled with tip4p water; use oplsaa forcefield",
+        "1500", "300", "1.01325", "0.1", "yes", "n",
+    ], llm, release=None)
+
+    assert server.request is not None
+    assert server.request["system"]["n_molecules"] == 1500
+    assert server.request["system"]["water_model"] == "tip4p"
+    assert server.request["force_field"] == "oplsaa"
+    assert server.request["thermo"] == {"temperature_K": 300.0, "pressure_bar": 1.01325}
+    assert server.request["protocol"]["prod_ns"] == 0.1
+    assert "could not complete" not in console.transcript
+    assert console.transcript.count("Which water model?") == 0
+
+
+@pytest.mark.anyio
+async def test_three_values_with_units_are_recorded_together(tmp_path):
+    server = SessionServer(tmp_path)
+    llm = StubLlm([say("")])
+    session, console = await finish_conversation(server, [
+        "n_molecules: 1500; water_model: tip4p; forcefield: oplsaa",
+        "300 K. 1.01325 bar. 0.1 ns",
+    ], llm, release=None)
+
+    assert session.draft.values["temperature_K"] == 300.0
+    assert session.draft.values["pressure_bar"] == 1.01325
+    assert session.draft.values["prod_ns"] == 0.1
+    assert console.transcript.count("What temperature (K)?") == 1
 
 
 @pytest.mark.anyio

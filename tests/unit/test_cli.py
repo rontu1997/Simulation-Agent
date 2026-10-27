@@ -75,6 +75,57 @@ def test_usage_errors_exit_2(capsys):
     assert exc.value.code == 2
 
 
+def test_structure_command_rejects_missing_coordinate_file_before_running(capsys, tmp_path):
+    assert cli.main(["structure", "--input", str(tmp_path / "missing.pdb"),
+                     "--force-field", "amber99sb-ildn", "--water-model", "tip3p",
+                     "--yes"]) == 2
+    assert "coordinate" in capsys.readouterr().err
+
+
+def test_structure_does_not_load_default_llm_env_file(tmp_path, capsys):
+    Path(".env").write_text("broken-not-an-env-line\n", encoding="utf-8")
+    assert cli.main(["structure", "--input", str(tmp_path / "missing.pdb"),
+                     "--force-field", "oplsaa", "--water-model", "tip4p",
+                     "--neutralize", "--yes"]) == 2
+    assert "line 1" not in capsys.readouterr().err
+
+
+def test_analyze_structure_rejects_missing_run_without_loading_llm_env(tmp_path, capsys):
+    Path(".env").write_text("broken-not-an-env-line\n", encoding="utf-8")
+    assert cli.main(["analyze-structure", "--run-dir", str(tmp_path / "missing")]) == 1
+    captured = capsys.readouterr()
+    assert "structure_run.json" in captured.err
+    assert "line 1" not in captured.err
+
+
+def test_structure_asks_for_analysis_text_before_approval(tmp_path, monkeypatch, capsys):
+    pdb = tmp_path / "protein.pdb"
+    pdb.write_text("END\n", encoding="utf-8")
+    answers = iter(["RMSD and radius of gyration", "y"])
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    chosen = []
+
+    def fake_run(options, cfg, runner):
+        chosen.append(options.analyses)
+        return options.output_dir
+
+    monkeypatch.setattr(cli, "run_structure", fake_run)
+    assert cli.main(["structure", "--input", str(pdb),
+                     "--force-field", "oplsaa", "--water-model", "tip4p"]) == 0
+    assert chosen == [("backbone_rmsd", "radius_of_gyration")]
+    assert "Analyses:" in capsys.readouterr().out
+
+
+def test_structure_analyses_option_rejects_unknown_text_before_md(tmp_path, monkeypatch, capsys):
+    pdb = tmp_path / "protein.pdb"
+    pdb.write_text("END\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "run_structure", lambda *args: pytest.fail("MD started"))
+    assert cli.main(["structure", "--input", str(pdb), "--force-field", "oplsaa",
+                     "--water-model", "tip4p", "--analyses", "RMSF", "--yes"]) == 2
+    assert "unsupported analysis request: RMSF" in capsys.readouterr().err
+
+
 def test_chat_needs_the_api_key_and_base_url(monkeypatch, capsys):
     monkeypatch.delenv("LUNA_API_KEY", raising=False)
     monkeypatch.delenv("LUNA_BASE_URL", raising=False)

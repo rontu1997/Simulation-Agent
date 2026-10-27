@@ -37,6 +37,8 @@ def build_gmx_env(gmx: GmxConfig, parent_env: Mapping[str, str]) -> dict[str, st
             continue
         if name in parent_env:
             env[name] = parent_env[name]
+    if gmx.library_dir is not None:
+        env["GMXLIB"] = gmx.library_dir
     prefix = Path(gmx.bin).parent.parent
     env["GMXDATA"] = str(prefix / "share" / "gromacs")
     env["GMXBIN"] = str(prefix / "bin")

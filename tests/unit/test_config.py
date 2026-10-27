@@ -3,6 +3,8 @@ from pathlib import Path
 import pytest
 
 from simagent.config import Config, ConfigError, load_config
+from simagent.core.gmx import build_gmx_env
+from simagent.gromacs_paths import apply_gromacs_paths
 
 GMX_DEFAULT = "/home/rontu/Rontu/software/software_install/gromacs-2025.3/bin/gmx"
 ROOT = Path(__file__).resolve().parents[2]
@@ -81,3 +83,22 @@ def test_gromacs_path_literal_only_in_config_module():
         if p.name != "config.py" and "gromacs-2025.3" in p.read_text(encoding="utf-8")
     ]
     assert offenders == []
+
+
+def test_dedicated_gromacs_paths_override_config_but_not_gmx_bin_env(tmp_path):
+    path = tmp_path / "gromacs_paths.yaml"
+    path.write_text("bin: /opt/gromacs/bin/gmx\nlibrary_dir: /opt/gromacs/share/gromacs/top\n",
+                    encoding="utf-8")
+    cfg = apply_gromacs_paths(load_config(env={}), path, env={})
+    assert cfg.gmx.bin == "/opt/gromacs/bin/gmx"
+    assert build_gmx_env(cfg.gmx, {})["GMXLIB"] == "/opt/gromacs/share/gromacs/top"
+    override = apply_gromacs_paths(load_config(env={"GMX_BIN": "/custom/gmx"}), path,
+                                   env={"GMX_BIN": "/custom/gmx"})
+    assert override.gmx.bin == "/custom/gmx"
+
+
+def test_dedicated_gromacs_paths_rejects_unknown_fields(tmp_path):
+    path = tmp_path / "gromacs_paths.yaml"
+    path.write_text("bin: /opt/gmx\nsecret: value\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="unknown"):
+        apply_gromacs_paths(load_config(env={}), path, env={})

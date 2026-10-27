@@ -16,6 +16,7 @@ import secrets
 import sys
 import threading
 from collections.abc import Awaitable, Callable, Sequence
+from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -26,9 +27,20 @@ from simagent.agent.conversation import ChatClient
 from simagent.agent.request import draft_from_request_file, finalize, non_interactive_errors
 from simagent.agent.session import Console, Session
 from simagent.config import Config, ConfigError, default_config_path, load_config
+from simagent.core.gmx import GmxRunner
+from simagent.core.provenance import Ledger
 from simagent.envfile import EnvFileError, load_env_file
+from simagent.gromacs_paths import apply_gromacs_paths
 from simagent.llm import LlmClient
 from simagent.mcp_client import McpSession, server_params
+from simagent.structure import StructureRun, StructureRunError, run_structure
+from simagent.structure_analysis import (
+    StructureAnalysisError,
+    analysis_labels,
+    analyze_structure,
+    default_analyses,
+    parse_analysis_text,
+)
 
 # Tests replace this to poll quickly; the controller enforces and tests the 10 s floor itself.
 _poll_sleep: Callable[[float], Awaitable[None]] | None = None
@@ -133,7 +145,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="store_true", help="print the version and exit")
     parser.add_argument("--env-file", metavar="PATH",
                         help="read LUNA_*, GMX_*, and SIMAGENT_* settings from this file "
-                        "(default: ./.env if it exists; real environment variables win)")
+                        "(default: ./.env for chat and run; real environment variables win)")
     commands = parser.add_subparsers(dest="command")
     run = commands.add_parser("run", help="run a finished request file without a conversation")
     run.add_argument("--request-file", required=True, help="a JSON request (design 3.1 shape)")
@@ -141,6 +153,34 @@ def _parser() -> argparse.ArgumentParser:
                      help="approve the plan automatically (recorded as mode auto)")
     run.add_argument("--confirm-long-run", action="store_true",
                      help="also confirm a production run above the long-run limit")
+    structure = commands.add_parser(
+        "structure", help="simulate a PDB/GRO structure using installed .rtp residues")
+    structure.add_argument("--input", required=True, help="PDB or GRO coordinate file")
+    structure.add_argument("--force-field", required=True,
+                           help="installed force field directory name, without .ff")
+    structure.add_argument("--water-model", required=True,
+                           help="water model accepted by the selected force field")
+    structure.add_argument("--stages", default="em,nvt",
+                           choices=("em,nvt", "em,nvt,npt", "em,nvt,npt,prod"))
+    structure.add_argument("--temperature", type=float, default=300.0, metavar="K")
+    structure.add_argument("--pressure", type=float, default=1.0, metavar="BAR")
+    structure.add_argument("--dt-ps", type=float, default=0.002)
+    structure.add_argument("--nvt-ps", type=float, default=100.0)
+    structure.add_argument("--npt-ps", type=float, default=100.0)
+    structure.add_argument("--prod-ns", type=float, default=1.0)
+    structure.add_argument("--padding-nm", type=float, default=1.0)
+    structure.add_argument("--seed", type=int, default=42)
+    structure.add_argument("--neutralize", action="store_true",
+                           help="replace water with enough Na+/Cl- to neutralize the system")
+    structure.add_argument("--analyses", metavar="TEXT",
+                           help="plain-text measurements, e.g. 'RMSD, Rg and temperature'")
+    structure.add_argument("--output-dir", help="new directory for this run")
+    structure.add_argument("--yes", action="store_true", help="approve this structure run")
+    analysis = commands.add_parser(
+        "analyze-structure", help="analyze a completed structure run and write report.md")
+    analysis.add_argument("--run-dir", required=True, help="completed structure run directory")
+    analysis.add_argument("--analyses", metavar="TEXT",
+                          help="select measurements for reanalysis without rerunning MD")
     return parser
 
 
@@ -149,16 +189,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.version:
         print(f"simagent {__version__}")
         return 0
-    if not _load_env(args.env_file):
+    if not _load_env(args.env_file,
+                     use_default=args.command not in ("structure", "analyze-structure")):
         return 2
     try:
         cfg = load_config(yaml_path=default_config_path())
+        cfg = apply_gromacs_paths(cfg, Path("gromacs_paths.yaml"))
     except (ConfigError, OSError, ValueError) as exc:
         _error(f"configuration: {exc}")
         return 2
     try:
         if args.command == "run":
             return _run_file(args, cfg)
+        if args.command == "structure":
+            return _run_structure(args, cfg)
+        if args.command == "analyze-structure":
+            return _analyze_structure(args, cfg)
         return _chat(cfg)
     except KeyboardInterrupt:
         print("\nInterrupted. A stage that was running keeps running; start simagent again "
@@ -169,9 +215,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
 
-def _load_env(option: str | None) -> bool:
-    """Load the env file (the option, else ./.env when present) into the process environment."""
-    path = Path(option) if option else (Path(".env") if Path(".env").is_file() else None)
+def _load_env(option: str | None, *, use_default: bool = True) -> bool:
+    """Load an explicit env file, or the default for LLM-backed commands."""
+    path = Path(option) if option else (
+        Path(".env") if use_default and Path(".env").is_file() else None)
     if path is None:
         return True
     try:
@@ -194,6 +241,78 @@ def _read_request(path: str) -> dict[str, Any] | None:
         _error(f"{path} must contain a JSON object")
         return None
     return data
+
+
+def _run_structure(args: argparse.Namespace, cfg: Config) -> int:
+    source = Path(args.input)
+    if not source.is_file() or source.suffix.lower() not in (".pdb", ".gro"):
+        _error("input must be an existing PDB or GRO coordinate file; "
+               "in WSL, use /mnt/c/... for a file on Windows C:")
+        return 2
+    if not args.yes and not sys.stdin.isatty():
+        _error("input is not a terminal: add --yes to approve this structure run")
+        return 2
+    default_name = f"{source.stem}-{datetime.now(UTC):%Y%m%d-%H%M%S}-{secrets.token_hex(3)}"
+    output = Path(args.output_dir) if args.output_dir else (
+        cfg.paths.runs_dir / "structures" / default_name)
+    stage = args.stages.split(",")[-1]
+    defaults = default_analyses(stage)
+    if not args.yes:
+        print(f"Structure: {source}\nForce field: {args.force_field}\n"
+              f"Water model: {args.water_model}\nStages: {args.stages}\n"
+              f"Neutralize with Na+/Cl-: {'yes' if args.neutralize else 'no'}\n"
+              f"Output: {output}")
+    if args.analyses is not None:
+        try:
+            selected = parse_analysis_text(args.analyses, stage)
+        except StructureAnalysisError as exc:
+            _error(str(exc))
+            return 2
+    elif args.yes:
+        selected = defaults
+    else:
+        while True:
+            response = input(f"Analyses [Enter for {analysis_labels(defaults)}]: ")
+            try:
+                selected = parse_analysis_text(response, stage)
+                break
+            except StructureAnalysisError as exc:
+                _error(str(exc))
+    options = StructureRun(source, output, args.force_field, args.water_model,
+                           tuple(args.stages.split(",")), args.temperature, args.pressure,
+                           args.dt_ps, args.nvt_ps, args.npt_ps, args.prod_ns,
+                           args.padding_nm, args.seed, args.neutralize,
+                           analyses=selected)
+    if not args.yes:
+        print(f"Analyses: {analysis_labels(selected)}")
+        answer = input("Approve? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Not approved.")
+            return 1
+    try:
+        destination = run_structure(
+            options, cfg, GmxRunner(cfg, Ledger(output / "provenance.jsonl")))
+    except StructureRunError as exc:
+        _error(str(exc))
+        return 1
+    print(f"Structure run completed: {destination}")
+    print(f"Analysis report: {destination / 'report.md'}")
+    return 0
+
+
+def _analyze_structure(args: argparse.Namespace, cfg: Config) -> int:
+    run_dir = Path(args.run_dir)
+    try:
+        selected = (parse_analysis_text(args.analyses, "prod")
+                    if args.analyses is not None else None)
+        report = analyze_structure(
+            run_dir, cfg, GmxRunner(cfg, Ledger(run_dir / "provenance.jsonl")),
+            requested=selected)
+    except StructureAnalysisError as exc:
+        _error(str(exc))
+        return 1
+    print(f"Analysis report: {report}")
+    return 0
 
 
 def _run_file(args: argparse.Namespace, cfg: Config) -> int:

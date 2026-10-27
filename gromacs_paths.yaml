@@ -1,0 +1,4 @@
+# Edit these paths for your GROMACS installation in Ubuntu WSL.
+# bin is the executable; library_dir contains the installed *.ff directories and .rtp files.
+bin: /home/rontu/Rontu/software/software_install/gromacs-2025.3/bin/gmx
+library_dir: /home/rontu/Rontu/software/software_install/gromacs-2025.3/share/gromacs/top

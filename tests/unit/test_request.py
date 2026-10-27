@@ -7,6 +7,7 @@ from simagent.agent.request import (
     RequestDraft,
     accept,
     draft_from_request_file,
+    explicit_clarification_answers,
     finalize,
     merge_submission,
     missing_questions,
@@ -56,6 +57,34 @@ def test_stated_fields_are_never_asked_and_inferred_ones_are_confirmed():
     assert "n_molecules" not in fields and "temperature_K" not in fields
     confirm = next(q for q in questions if q.field == "water_model")
     assert "tip4p" in confirm.text and confirm.proposal == "tip4p"
+
+
+def test_explicit_answers_do_not_turn_box_size_or_negation_into_choices():
+    questions = missing_questions(empty())
+    assert explicit_clarification_answers(
+        "3.5 nm box. Not TIP4P. Not OPLSAA.", questions) == {}
+
+
+def test_explicit_answers_read_initial_water_choices_and_unit_tagged_values():
+    initial = ("create a 3.5 nm cubic box filled with tip4p water; "
+               "use oplsaa forcefield for 100 ps NVT with a 2 fs timestep")
+    choices = explicit_clarification_answers(initial, missing_questions(empty(), limit=7))
+    assert choices == {"water_model": "tip4p", "force_field": "oplsaa",
+                       "origins": {"water_model": "user", "force_field": "user"}}
+
+    draft = merge_submission(empty(), {**choices, "n_molecules": 1500,
+                                       "origins": {**choices["origins"], "n_molecules": "user"}})
+    questions = missing_questions(draft)
+    assert explicit_clarification_answers("300 K. 1.01325 bar. 0.1 ns", questions) == {
+        "temperature_K": 300.0, "pressure_bar": 1.01325, "prod_ns": 0.1,
+        "origins": {"temperature_K": "user", "pressure_bar": "user", "prod_ns": "user"}}
+    assert explicit_clarification_answers("300.", questions) == {
+        "temperature_K": 300.0, "origins": {"temperature_K": "user"}}
+    assert explicit_clarification_answers("300k", questions) == {
+        "temperature_K": 300.0, "origins": {"temperature_K": "user"}}
+    assert explicit_clarification_answers("1500. TIP4P. OPLSAA", missing_questions(empty())) == {
+        "n_molecules": 1500, "water_model": "tip4p", "force_field": "oplsaa",
+        "origins": {"n_molecules": "user", "water_model": "user", "force_field": "user"}}
 
 
 def test_an_inferred_value_does_not_overwrite_a_stated_one_but_user_does():
