@@ -3,8 +3,6 @@
 SimAgent runs molecular dynamics workflows with GROMACS from a terminal. It
 currently has two entry points:
 
-For a website-ready project case study, see [PORTFOLIO_REPORT.md](PORTFOLIO_REPORT.md).
-
 | Workflow | Input | What it runs |
 | --- | --- | --- |
 | Water agent (`simagent` or `simagent run --request-file`) | A description or JSON request for pure water | Builds a water box, then runs EM, NVT, NPT, and production through the MCP workflow |
@@ -14,6 +12,11 @@ For a website-ready project case study, see [PORTFOLIO_REPORT.md](PORTFOLIO_REPO
 residues.** The chat agent and JSON request workflow still accept pure water
 only. The structure command is a separate path and does not provide the water
 agent's physical gates, automatic diagnosis, or checkpoint resume.
+
+## Get the repository
+
+This project is published at
+[github.com/rontu1997/Simulation-Agent](https://github.com/rontu1997/Simulation-Agent).
 
 ## Requirements
 
@@ -37,10 +40,11 @@ From PowerShell, enter WSL:
 wsl -d Ubuntu
 ```
 
-Then move to the project and install the locked dependencies:
+Then clone the project and install the locked dependencies:
 
 ```bash
-cd /mnt/d/Rontu/Python/AI-Agent/Simulation-agent
+git clone https://github.com/rontu1997/Simulation-Agent.git
+cd Simulation-Agent
 UV_PROJECT_ENVIRONMENT=.venv-wsl uv sync --locked
 ```
 
